@@ -1,0 +1,24 @@
+Apprentissage Automatique et Apprentissage Profond
+
+L'apprentissage automatique est un sous-ensemble de l'intelligence artificielle qui permet aux systèmes d'apprendre à partir de données sans programmation explicite. L'apprentissage profond utilise des réseaux de neurones à plusieurs couches pour modéliser des motifs complexes.
+
+Concepts Clés:
+- Données d'Entraînement: Exemples utilisés pour enseigner le modèle
+- Ensemble de Validation: Données utilisées pour ajuster les hyperparamètres
+- Ensemble de Test: Données d'évaluation finale
+
+Fondement Mathématique:
+La fonction de perte $L(\theta)$ mesure la performance du modèle. La descente de gradient minimise la perte:
+$\theta_{t+1} = \theta_t - \alpha \nabla L(\theta_t)$
+
+Les applications incluent:
+1. Vision par ordinateur
+2. Traitement automatique du langage naturel
+3. Reconnaissance vocale
+4. Systèmes de recommandation
+
+Pour plus d'informations, visitez https://example.com/ml-guide ou envoyez un email à info@ml.example.com.
+
+Références:
+[1] LeCun et al. "Deep Learning." Nature, 2015.
+[2] Goodfellow et al. "Deep Learning Book." MIT Press, 2016.

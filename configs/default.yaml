@@ -1,0 +1,54 @@
+# SciTrans-LLMs Default Configuration
+
+translation:
+  default_backend: "openai"
+  default_model: "gpt-4o"
+  temperature: 0.3
+  num_candidates: 1
+  enable_caching: true
+  
+masking:
+  enabled: true
+  patterns:
+    - latex
+    - code
+    - url
+    - email
+    - doi
+    - citation
+  validate: true
+  
+context:
+  enabled: true
+  window_size: 3
+  max_context_length: 2000
+  
+reranking:
+  enabled: false
+  strategy: "weighted"
+  weights:
+    fluency: 0.25
+    adequacy: 0.30
+    terminology: 0.25
+    format: 0.10
+    consistency: 0.10
+  
+layout:
+  preserve: true
+  use_yolo: false
+  fallback_to_heuristic: true
+  
+quality:
+  min_score: 0.5
+  auto_retry: true
+  max_retries: 2
+  
+performance:
+  batch_size: 10
+  parallel_blocks: false
+  cache_dir: ".cache/translations"
+  
+logging:
+  level: "INFO"
+  file: "logs/scitran.log"
+  console: true

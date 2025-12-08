@@ -1,0 +1,24 @@
+Machine Learning and Deep Learning
+
+Machine learning is a subset of artificial intelligence that enables systems to learn from data without explicit programming. Deep learning uses neural networks with multiple layers to model complex patterns.
+
+Key Concepts:
+- Training Data: Examples used to teach the model
+- Validation Set: Data used to tune hyperparameters
+- Test Set: Final evaluation data
+
+Mathematical Foundation:
+The loss function $L(\theta)$ measures model performance. Gradient descent minimizes loss:
+$\theta_{t+1} = \theta_t - \alpha \nabla L(\theta_t)$
+
+Applications include:
+1. Computer vision
+2. Natural language processing
+3. Speech recognition
+4. Recommender systems
+
+For more information, visit https://example.com/ml-guide or email info@ml.example.com.
+
+References:
+[1] LeCun et al. "Deep Learning." Nature, 2015.
+[2] Goodfellow et al. "Deep Learning Book." MIT Press, 2016.

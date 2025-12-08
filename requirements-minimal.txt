@@ -1,0 +1,46 @@
+# Core Dependencies (Essential)
+# Note: Requires Python >= 3.9
+numpy>=1.24.0
+pandas>=2.0.0
+pyyaml>=6.0
+tqdm>=4.65.0
+rich>=13.0.0
+python-dotenv>=1.0.0
+
+# PDF Processing
+PyMuPDF>=1.23.0
+pypdf>=3.0.0
+pdfplumber>=0.9.0
+Pillow>=10.0.0
+
+# Translation Backends (Lightweight)
+openai>=2.0.0
+anthropic>=0.3.0,<0.8.0
+deep-translator>=1.11.0
+ollama>=0.1.0
+
+# GUI (Optional - comment out if not needed)
+# gradio>=4.0.0
+# plotly>=5.0.0
+
+# Natural Language Processing (Basic)
+nltk>=3.8.0
+sacrebleu>=2.3.0
+sacremoses>=0.0.53
+
+# API & Web
+requests>=2.31.0
+aiohttp>=3.9.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# Utilities
+click>=8.1.0
+typer>=0.9.0
+loguru>=0.7.0
+python-json-logger>=2.0.0
+
+# Cache and Storage
+diskcache>=5.6.0
+redis>=5.0.0
+sqlalchemy>=2.0.0
