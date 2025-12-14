@@ -1,16 +1,75 @@
-#!/usr/bin/env python3
-"""
-SciTrans CLI wrapper script for easy command execution.
-Makes it easy to run: ./scitrans translate file.pdf
-"""
+#!/bin/bash
+# SciTrans LLMs - Scientific Document Translation
+# This script ensures the correct Python environment is used
 
+# Resolve symlinks to get the actual script location
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$( cd -P "$( dirname "$SOURCE" )" &> /dev/null && pwd )"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" &> /dev/null && pwd )"
+
+VENV_DIR="$SCRIPT_DIR/.venv"
+PYTHON="$VENV_DIR/bin/python3"
+
+# Check if venv exists
+if [ ! -f "$PYTHON" ]; then
+    echo "Virtual environment not found at $VENV_DIR"
+    echo "Please run: cd $SCRIPT_DIR && python3 -m venv .venv && .venv/bin/pip install -r requirements-core.txt gradio PyMuPDF"
+    exit 1
+fi
+
+# Run the appropriate command
+case "$1" in
+    gui)
+        echo "Launching SciTrans GUI at http://localhost:7860"
+        exec "$PYTHON" -c "
 import sys
-from pathlib import Path
+sys.path.insert(0, '$SCRIPT_DIR')
+from gui.app import launch
+launch()
+"
+        ;;
+    translate)
+        shift
+        exec "$PYTHON" -m cli.commands.main translate "$@"
+        ;;
+    test)
+        exec "$PYTHON" -m cli.commands.main test "$@"
+        ;;
+    backends)
+        exec "$PYTHON" -m cli.commands.main backends "$@"
+        ;;
+    wizard)
+        exec "$PYTHON" -m cli.commands.main wizard
+        ;;
+    cli)
+        exec "$PYTHON" -m cli.commands.main "$@"
+        ;;
+    help|--help|-h)
+        cat << EOF
+SciTrans LLMs - Scientific Document Translation
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+Usage:
+  scitrans gui                     Launch web GUI
+  scitrans translate <pdf>         Translate a PDF
+  scitrans translate <pdf> -o out  Translate with output path
+  scitrans test                    Run system tests
+  scitrans backends                List available backends
+  scitrans wizard                  Interactive wizard
+  scitrans cli                     Enter CLI mode
+  scitrans help                    Show this help
 
-from cli.commands.main import cli
-
-if __name__ == "__main__":
-    cli()
+Examples:
+  scitrans gui
+  scitrans translate paper.pdf
+  scitrans translate paper.pdf --backend openai -o translated.pdf
+EOF
+        ;;
+    *)
+        # Default: pass to CLI
+        exec "$PYTHON" -m cli.commands.main "$@"
+        ;;
+esac

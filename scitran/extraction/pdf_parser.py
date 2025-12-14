@@ -16,7 +16,7 @@ try:
 except ImportError:
     HAS_PDFPLUMBER = False
 
-from ..core.models import Document, Block, BoundingBox
+from ..core.models import Document, Block, BoundingBox, BlockType
 
 
 class PDFParser:
@@ -80,22 +80,50 @@ class PDFParser:
         return document
     
     def _extract_page_blocks(self, page, page_num: int, start_id: int) -> List[Block]:
-        """Extract blocks from a single page."""
+        """Extract blocks from a single page with font information."""
+        from ..core.models import FontInfo
+        
         blocks = []
         
         # Get text with layout information
-        text_dict = page.get_text("dict")
+        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
         
         for block_idx, block_data in enumerate(text_dict.get("blocks", [])):
             if "lines" not in block_data:
+                # Non-text blocks (likely images/figures) - keep as figure placeholders
+                bbox = block_data.get("bbox", [0, 0, 0, 0])
+                bounding_box = BoundingBox(
+                    x0=bbox[0],
+                    y0=bbox[1],
+                    x1=bbox[2],
+                    y1=bbox[3],
+                    page=page_num,
+                )
+                figure_block = Block(
+                    block_id=f"block_{start_id + len(blocks)}",
+                    source_text="",
+                    bbox=bounding_box,
+                    block_type=BlockType.FIGURE,
+                    metadata={"page": page_num, "block_type": "figure"},
+                )
+                blocks.append(figure_block)
                 continue  # Skip image blocks for now
             
-            # Extract text from block
+            # Extract text and font info from block
             lines = []
+            fonts = []  # Collect font info from spans
+            
             for line in block_data["lines"]:
                 line_text = ""
                 for span in line["spans"]:
                     line_text += span["text"]
+                    # Collect font information
+                    fonts.append({
+                        "family": span.get("font", ""),
+                        "size": span.get("size", 11),
+                        "color": span.get("color", 0),
+                        "flags": span.get("flags", 0)  # bold, italic flags
+                    })
                 lines.append(line_text)
             
             text = "\n".join(lines).strip()
@@ -112,14 +140,53 @@ class PDFParser:
                 page=page_num
             )
             
-            # Create block
+            # Get dominant font from spans (most common or first)
+            font_info = None
+            if fonts:
+                dominant_font = fonts[0]  # Use first span's font
+                # Convert color int to hex
+                color_int = dominant_font.get("color", 0)
+                if isinstance(color_int, int):
+                    color_hex = f"#{color_int:06x}"
+                else:
+                    color_hex = "#000000"
+                
+                # Parse font flags for weight/style
+                # PyMuPDF flags: bit0=superscript, bit1=italic, bit2=serif, bit3=mono, bit4=bold
+                flags = dominant_font.get("flags", 0)
+                weight = "bold" if flags & 16 else "normal"  # Bit 4 = bold (16)
+                style = "italic" if flags & 2 else "normal"  # Bit 1 = italic (2)
+                
+                # Also detect font type from flags
+                font_family = dominant_font.get("family", "")
+                is_serif = bool(flags & 4)    # Bit 2 = serif
+                is_mono = bool(flags & 8)     # Bit 3 = monospace
+                
+                # Add hints to font family for better rendering
+                if is_mono and "mono" not in font_family.lower() and "cour" not in font_family.lower():
+                    font_family = f"{font_family} mono"
+                elif is_serif and "serif" not in font_family.lower() and "times" not in font_family.lower():
+                    font_family = f"{font_family} serif"
+                
+                font_info = FontInfo(
+                    family=font_family,
+                    size=dominant_font.get("size", 11),
+                    weight=weight,
+                    style=style,
+                    color=color_hex
+                )
+            
+            # Create block with font info
+            classified = self._classify_block(text)
             block = Block(
                 block_id=f"block_{start_id + len(blocks)}",
                 source_text=text,
                 bbox=bounding_box,
+                font=font_info,
+                block_type=self._map_block_type(classified),
                 metadata={
                     "page": page_num,
-                    "block_type": self._classify_block(text),
+                    "block_type": classified,
                     "num_lines": len(lines)
                 }
             )
@@ -131,27 +198,44 @@ class PDFParser:
     def _classify_block(self, text: str) -> str:
         """Classify block type based on content."""
         text_lower = text.lower().strip()
+        words = text.split()
         
-        # Check for common patterns
-        if len(text) < 100 and text.isupper():
+        # Titles / headings
+        if len(text) < 120 and text.isupper():
             return "title"
-        
-        if re.match(r"^\d+\.?\s+", text):
-            return "numbered_section"
-        
         if text.startswith("Abstract"):
             return "abstract"
-        
-        if any(keyword in text_lower for keyword in ["figure", "fig.", "table"]):
-            return "caption"
-        
-        if re.search(r'\$.*\$|\\[a-z]+', text):
-            return "math_content"
-        
-        if len(text.split()) < 10:
+        if re.match(r"^\d+\.?\s+", text):
+            return "numbered_section"
+        if len(words) < 10:
             return "heading"
         
+        # Figures / tables (keywords)
+        if any(keyword in text_lower for keyword in ["figure", "fig.", "table", "tbl.", "tab."]):
+            return "caption"
+        
+        # Table-like patterns: multiple columns separated by tabs/pipes or repeated spaces
+        if ("|" in text and text.count("|") >= 2) or ("\t" in text) or re.search(r"\s{2,}\S+\s{2,}\S+", text):
+            return "table"
+        
+        # Math detection: latex markers, many symbols, caret/superscripts
+        if re.search(r'\$.*?\$|\\[a-zA-Z]+|≠|≈|≥|≤|∑|∫|√|∞|→|←|\^|_{|}', text):
+            return "math_content"
+        
         return "paragraph"
+    
+    def _map_block_type(self, cls: str) -> BlockType:
+        """Map classifier string to BlockType enum."""
+        mapping = {
+            "title": BlockType.TITLE,
+            "abstract": BlockType.ABSTRACT,
+            "numbered_section": BlockType.SUBHEADING,
+            "heading": BlockType.HEADING,
+            "caption": BlockType.CAPTION,
+            "table": BlockType.TABLE,
+            "math_content": BlockType.EQUATION,
+        }
+        return mapping.get(cls, BlockType.PARAGRAPH)
     
     def extract_metadata(self, pdf_path: str) -> Dict:
         """Extract PDF metadata."""

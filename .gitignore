@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.pyc
 .Python
 build/
 develop-eggs/
@@ -25,6 +26,7 @@ MANIFEST
 venv/
 env/
 ENV/
+.venv/
 .venv
 
 # IDEs
@@ -34,6 +36,7 @@ ENV/
 *.swo
 *~
 .DS_Store
+.cursor/
 
 # Testing
 .pytest_cache/
@@ -47,10 +50,12 @@ dmypy.json
 # Logs
 *.log
 logs/
+debug.log
 
 # Cache
 .cache/
 *.cache
+.scitran_cache/
 
 # API Keys (IMPORTANT!)
 configs/keys.yaml
@@ -58,11 +63,17 @@ configs/keys.yaml
 *.key
 
 # Data
-corpus/*/
+corpus/test/*
+corpus/training/*
+corpus/validation/*
+!corpus/test/.gitkeep
+!corpus/training/.gitkeep
+!corpus/validation/.gitkeep
 results/
 output/
 *.pdf
-!examples/*.pdf
+!test_data/*.pdf
+!docs/*.pdf
 
 # Temporary
 tmp/
@@ -74,5 +85,5 @@ temp/
 Thumbs.db
 
 # Project specific
-.scitran_cache/
 translations.db
+.scitrans/

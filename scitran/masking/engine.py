@@ -213,56 +213,66 @@ class MaskingEngine:
         """
         if not block.source_text or not block.is_translatable:
             return block
-            
+        
+        # First, find all matches across all patterns on the original text
+        all_matches: List[Tuple[int, int, str, str, bool]] = []  # (start, end, original, pattern_name, preserve_fmt)
+        
+        for pattern_def in self.patterns:
+            matches = list(pattern_def.pattern.finditer(block.source_text))
+            for match in matches:
+                start, end = match.span()
+                all_matches.append((
+                    start, 
+                    end, 
+                    match.group(0),
+                    pattern_def.name,
+                    pattern_def.preserve_formatting
+                ))
+        
+        # Sort by start position
+        all_matches.sort(key=lambda x: x[0])
+        
+        # Remove overlapping matches (keep higher priority ones - they were added first due to pattern order)
+        non_overlapping = []
+        for match in all_matches:
+            start, end = match[0], match[1]
+            # Check if this overlaps with any already accepted match
+            overlaps = False
+            for accepted in non_overlapping:
+                a_start, a_end = accepted[0], accepted[1]
+                if start < a_end and end > a_start:
+                    overlaps = True
+                    break
+            if not overlaps:
+                non_overlapping.append(match)
+        
+        # Sort by position in reverse order for safe replacement
+        non_overlapping.sort(key=lambda x: x[0], reverse=True)
+        
+        # Now apply replacements from end to start
         masked_text = block.source_text
         masks = []
         
-        # Track what's already masked to avoid overlaps
-        masked_ranges: List[Tuple[int, int]] = []
-        
-        for pattern_def in self.patterns:
-            # Find all matches
-            matches = list(pattern_def.pattern.finditer(masked_text))
+        for start, end, original, pattern_name, preserve_fmt in non_overlapping:
+            # Generate placeholder
+            placeholder = self._generate_placeholder(pattern_name)
             
-            for match in matches:
-                start, end = match.span()
-                
-                # Check if this range overlaps with already masked content
-                if any(start < m_end and end > m_start 
-                      for m_start, m_end in masked_ranges):
-                    continue  # Skip overlapping matches
-                    
-                # Generate placeholder
-                placeholder = self._generate_placeholder(pattern_def.name)
-                
-                # Store mask info
-                mask_info = MaskInfo(
-                    original=match.group(0),
-                    placeholder=placeholder,
-                    mask_type=pattern_def.name,
-                    preserve_formatting=pattern_def.preserve_formatting
-                )
-                masks.append(mask_info)
-                self.mask_registry[placeholder] = mask_info
-                
-                # Replace in text (adjust for previous replacements)
-                offset = len(placeholder) - len(match.group(0))
-                masked_text = (
-                    masked_text[:start] + 
-                    placeholder + 
-                    masked_text[end:]
-                )
-                
-                # Update masked ranges
-                masked_ranges.append((start, start + len(placeholder)))
-                
-                # Adjust future ranges for the length change
-                masked_ranges = [
-                    (s if s < start else s + offset,
-                     e if e <= start else e + offset)
-                    for s, e in masked_ranges
-                ]
-                
+            # Store mask info
+            mask_info = MaskInfo(
+                original=original,
+                placeholder=placeholder,
+                mask_type=pattern_name,
+                preserve_formatting=preserve_fmt
+            )
+            masks.append(mask_info)
+            self.mask_registry[placeholder] = mask_info
+            
+            # Replace in text (from end to start, so positions stay valid)
+            masked_text = masked_text[:start] + placeholder + masked_text[end:]
+        
+        # Reverse masks to maintain original order
+        masks.reverse()
+        
         block.masked_text = masked_text
         block.masks = masks
         
@@ -307,11 +317,14 @@ class MaskingEngine:
         # Update block
         block.translated_text = unmasked_text
         
-        # Add validation stats to metadata
-        if block.metadata:
-            block.metadata.glossary_terms_used.add(f"masks_restored:{restored_count}")
-            if missing_masks:
-                block.metadata.glossary_terms_used.add(f"masks_missing:{len(missing_masks)}")
+        # Add validation stats to metadata (if TranslationMetadata object)
+        if block.metadata and hasattr(block.metadata, 'glossary_terms_used'):
+            try:
+                block.metadata.glossary_terms_used.add(f"masks_restored:{restored_count}")
+                if missing_masks:
+                    block.metadata.glossary_terms_used.add(f"masks_missing:{len(missing_masks)}")
+            except (AttributeError, TypeError):
+                pass  # metadata is a dict or doesn't support this
                 
         logger.debug(f"Restored {restored_count}/{len(block.masks)} masks in block {block.block_id}")
         

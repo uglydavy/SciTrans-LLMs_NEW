@@ -24,7 +24,14 @@ __version__ = "2.0.0"
 __author__ = "SciTrans Team"
 __license__ = "MIT"
 
-# Core exports
+# Build __all__ dynamically based on what imports successfully
+__all__ = [
+    "__version__",
+    "__author__",
+    "__license__",
+]
+
+# Core models - always available
 from scitran.core.models import (
     Document,
     Block,
@@ -36,86 +43,69 @@ from scitran.core.models import (
     TranslationResult,
     TranslationMetadata
 )
+__all__.extend([
+    "Document", "Block", "Segment", "BoundingBox", "FontInfo",
+    "MaskInfo", "BlockType", "TranslationResult", "TranslationMetadata"
+])
 
-from scitran.core.pipeline import (
-    TranslationPipeline,
-    PipelineConfig
-)
+# Pipeline - requires scoring module
+try:
+    from scitran.core.pipeline import (
+        TranslationPipeline,
+        PipelineConfig
+    )
+    __all__.extend(["TranslationPipeline", "PipelineConfig"])
+except ImportError as e:
+    import logging
+    logging.warning(f"Pipeline not available: {e}")
 
-# Masking
+# Masking - always available
 from scitran.masking.engine import (
     MaskingEngine,
     MaskingConfig
 )
+__all__.extend(["MaskingEngine", "MaskingConfig"])
 
-# Scoring
-from scitran.scoring.reranker import (
-    AdvancedReranker,
-    ScoringStrategy,
-    MultiDimensionalScorer
-)
+# Scoring - may require numpy
+try:
+    from scitran.scoring.reranker import (
+        AdvancedReranker,
+        ScoringStrategy,
+        MultiDimensionalScorer
+    )
+    __all__.extend(["AdvancedReranker", "ScoringStrategy", "MultiDimensionalScorer"])
+except ImportError as e:
+    import logging
+    logging.warning(f"Reranker not available: {e}")
 
-# Extraction
-from scitran.extraction.pdf_parser import PDFParser
+# Extraction - requires PyMuPDF
+try:
+    from scitran.extraction.pdf_parser import PDFParser
+    __all__.append("PDFParser")
+except ImportError:
+    pass
 
-# Rendering
-from scitran.rendering.pdf_renderer import PDFRenderer
+# Rendering - requires PyMuPDF
+try:
+    from scitran.rendering.pdf_renderer import PDFRenderer
+    __all__.append("PDFRenderer")
+except ImportError:
+    pass
 
-# Translation
+# Translation base - always available
 from scitran.translation.base import (
     TranslationBackend,
     TranslationRequest,
     TranslationResponse
 )
+__all__.extend(["TranslationBackend", "TranslationRequest", "TranslationResponse"])
 
+# Prompts - always available
 from scitran.translation.prompts import (
     PromptOptimizer,
     PromptLibrary,
     PromptTemplate,
     PromptStrategy
 )
-
-__all__ = [
-    # Version info
-    "__version__",
-    "__author__",
-    "__license__",
-    
-    # Core
-    "Document",
-    "Block",
-    "Segment",
-    "BoundingBox",
-    "FontInfo",
-    "MaskInfo",
-    "BlockType",
-    "TranslationResult",
-    "TranslationMetadata",
-    "TranslationPipeline",
-    "PipelineConfig",
-    
-    # Masking
-    "MaskingEngine",
-    "MaskingConfig",
-    
-    # Scoring
-    "AdvancedReranker",
-    "ScoringStrategy",
-    "MultiDimensionalScorer",
-    
-    # Extraction
-    "PDFParser",
-    
-    # Rendering
-    "PDFRenderer",
-    
-    # Translation
-    "TranslationBackend",
-    "TranslationRequest",
-    "TranslationResponse",
-    "PromptOptimizer",
-    "PromptLibrary",
-    "PromptTemplate",
-    "PromptStrategy",
-]
+__all__.extend(["PromptOptimizer", "PromptLibrary", "PromptTemplate", "PromptStrategy"])
 

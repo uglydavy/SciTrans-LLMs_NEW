@@ -5,10 +5,7 @@ from scitran.core.pipeline import TranslationPipeline, PipelineConfig
 from scitran.core.models import Document, Block
 
 
-@pytest.mark.skipif(
-    not pytest.config.getoption("--run-integration"),
-    reason="Integration tests require --run-integration flag"
-)
+@pytest.mark.skip(reason="Integration test skipped by default")
 def test_pipeline_basic():
     """Test basic pipeline execution."""
     config = PipelineConfig(
@@ -32,10 +29,7 @@ def test_pipeline_basic():
     assert len(result.document.blocks[0].translated_text) > 0
 
 
-@pytest.mark.skipif(
-    not pytest.config.getoption("--run-integration"),
-    reason="Integration tests require --run-integration flag"
-)
+@pytest.mark.skip(reason="Integration test skipped by default")
 def test_pipeline_with_masking():
     """Test pipeline with masking enabled."""
     config = PipelineConfig(

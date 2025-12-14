@@ -1,7 +1,8 @@
 """Unit tests for core models."""
 
 import pytest
-from scitran.core.models import Block, Document, BoundingBox
+from scitran.core.models import Block, Document, BoundingBox, Segment
+from dataclasses import asdict
 
 
 def test_block_creation():
@@ -18,14 +19,14 @@ def test_block_creation():
 
 def test_block_with_bbox():
     """Test Block with bounding box."""
-    bbox = BoundingBox(x=10, y=20, width=100, height=50, page=0)
+    bbox = BoundingBox(page=0, x0=10.0, y0=20.0, x1=110.0, y1=70.0)
     block = Block(
         block_id="test_2",
         source_text="Text with position",
         bbox=bbox
     )
     
-    assert block.bbox.x == 10
+    assert block.bbox.x0 == 10.0
     assert block.bbox.page == 0
 
 
@@ -35,36 +36,39 @@ def test_document_creation():
         Block(block_id="1", source_text="First"),
         Block(block_id="2", source_text="Second")
     ]
+    segment = Segment(segment_id="seg1", segment_type="section", blocks=blocks)
+    doc = Document(document_id="test_doc", segments=[segment])
     
-    doc = Document(doc_id="test_doc", blocks=blocks)
-    
-    assert doc.doc_id == "test_doc"
-    assert len(doc.blocks) == 2
+    assert doc.document_id == "test_doc"
+    assert len(doc.all_blocks) == 2
 
 
 def test_document_serialization():
     """Test Document serialization."""
     block = Block(block_id="1", source_text="Test")
-    doc = Document(doc_id="test", blocks=[block])
+    segment = Segment(segment_id="seg1", segment_type="section", blocks=[block])
+    doc = Document(document_id="test", segments=[segment])
     
-    data = doc.to_dict()
+    data = asdict(doc)
     
-    assert data["doc_id"] == "test"
-    assert len(data["blocks"]) == 1
-    assert data["blocks"][0]["source_text"] == "Test"
+    assert data["document_id"] == "test"
+    assert len(data["segments"]) == 1
+    assert data["segments"][0]["blocks"][0]["source_text"] == "Test"
 
 
 def test_document_deserialization():
-    """Test Document deserialization."""
-    data = {
-        "doc_id": "test",
-        "blocks": [
-            {"block_id": "1", "source_text": "Test"}
-        ]
-    }
+    """Test Document creation from components."""
+    segment_data = Segment(
+        segment_id="seg1",
+        segment_type="section",
+        blocks=[Block(block_id="1", source_text="Test")]
+    )
     
-    doc = Document.from_dict(data)
+    doc = Document(
+        document_id="test",
+        segments=[segment_data]
+    )
     
-    assert doc.doc_id == "test"
-    assert len(doc.blocks) == 1
-    assert doc.blocks[0].source_text == "Test"
+    assert doc.document_id == "test"
+    assert len(doc.all_blocks) == 1
+    assert doc.all_blocks[0].source_text == "Test"

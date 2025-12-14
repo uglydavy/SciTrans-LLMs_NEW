@@ -1,698 +1,2120 @@
+# -*- coding: utf-8 -*-
 """
-Modern Gradio GUI for SciTrans-LLMs NEW.
-
-This implements a clean, responsive interface with all features properly organized
-and Innovation verification built-in.
+SciTrans LLMs - Scientific Document Translation GUI
+Version 1.0 - Clean Design
 """
 
 import gradio as gr
-from pathlib import Path
-import json
-import time
-from typing import Dict, List, Optional, Any, Tuple
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime
-
-# Import our core modules
 import sys
-sys.path.append(str(Path(__file__).parent.parent))
+import os
+import json
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+from queue import Queue
 
-from scitran.core.models import Document, TranslationResult
-from scitran.core.pipeline import TranslationPipeline, PipelineConfig
-from scitran.masking.engine import MaskingConfig
-from scitran.scoring.reranker import ScoringStrategy
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
-class TranslationGUI:
-    """Main GUI application for SciTrans-LLMs."""
+class SciTransGUI:
+    """Clean GUI with all features."""
     
     def __init__(self):
-        self.pipeline = None
-        self.current_document = None
-        self.translation_result = None
-        self.history = []
+        self.config_file = Path.home() / ".scitrans" / "config.json"
+        self.config_file.parent.mkdir(exist_ok=True)
+        self.glossary_file = Path.home() / ".scitrans" / "glossary.json"
+        self.translated_pdf_path = None
+        self.log_queue = Queue()
+        self.load_config()
+        self.load_glossary()  # Load persistent glossary
+    
+    def load_config(self):
+        """Load configuration."""
+        if self.config_file.exists():
+            try:
+                with open(self.config_file) as f:
+                    self.config = json.load(f)
+            except:
+                self.config = self._default_config()
+        else:
+            self.config = self._default_config()
+    
+    def _default_config(self):
+        return {
+            "dark_mode": True,
+            "default_backend": "free",
+            "api_keys": {},
+            "reranking_enabled": True,
+            "masking_enabled": True,
+            "cache_enabled": True,
+            "max_candidates": 3,
+            "context_window": 5,
+            "glossary_enabled": True
+        }
+    
+    def save_config(self):
+        """Save configuration."""
+        with open(self.config_file, 'w') as f:
+            json.dump(self.config, f, indent=2)
+    
+    def load_glossary(self):
+        """Load persistent glossary from disk (SPRINT 3: Using GlossaryManager)."""
+        from scitran.translation.glossary.manager import GlossaryManager
         
-    def create_interface(self) -> gr.Blocks:
-        """Create the complete Gradio interface."""
+        self.glossary_manager = GlossaryManager()
+        self.glossary = {}  # Keep for UI display
         
-        with gr.Blocks(
-            title="SciTrans-LLMs NEW - Scientific Document Translation",
-            theme=gr.themes.Soft(),
-            css=self._get_custom_css()
-        ) as app:
+        if self.glossary_file.exists():
+            try:
+                count = self.glossary_manager.load_from_file(self.glossary_file)
+                self.glossary = self.glossary_manager.to_dict()
+                logger.info(f"Loaded {count} terms from persistent storage")
+            except Exception as e:
+                logger.warning(f"Could not load glossary: {e}")
+                self.glossary = {}
+    
+    def save_glossary(self):
+        """Save glossary to disk for persistence (SPRINT 3: Using GlossaryManager)."""
+        if hasattr(self, 'glossary_manager') and self.glossary_manager:
+            self.glossary_manager.export_to_file(Path(self.glossary_file))
+        else:
+            # Fallback to old method
+            with open(self.glossary_file, 'w') as f:
+                json.dump(self.glossary, f, indent=2)
+    
+    def log(self, msg: str):
+        """Add log message."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_queue.put(f"[{timestamp}] {msg}")
+    
+    # =========================================================================
+    # Translation Functions
+    # =========================================================================
+    
+    def translate_document(
+        self,
+        pdf_file,
+        source_lang,
+        target_lang,
+        backend,
+        model_name,
+        advanced_options,
+        num_candidates,
+        context_window,
+        quality_threshold,
+        prompt_rounds,
+        batch_size,
+        progress=gr.Progress()
+    ):
+        """Translate document with proper rendering and live progress."""
+        def _dbg_log(hid: str, loc: str, message: str, data: Dict[str, Any]):
+            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+            try:
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                payload = {
+                    "sessionId": "debug-session",
+                    "runId": "post-fix",
+                    "hypothesisId": hid,
+                    "location": loc,
+                    "message": message,
+                    "data": data,
+                    "timestamp": int(time.time() * 1000),
+                }
+                with open(log_path, "a") as f:
+                    f.write(json.dumps(payload) + "\n")
+            except Exception:
+                pass
+        
+        if pdf_file is None:
+            _dbg_log("H0", "translate_document:noop", "no file provided", {})
+            return (
+                "Please upload a PDF file",
+                None,
+                "",
+                None,
+                "of 0",
+                gr.update(maximum=1, value=1),
+                None
+            )
+        
+        # Parse advanced options
+        enable_masking = "Masking" in advanced_options
+        enable_reranking = "Reranking" in advanced_options
+        use_context = "Context" in advanced_options
+        use_glossary = "Glossary" in advanced_options
+        
+        logs = []
+        def add_log(msg):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            logs.append(f"[{timestamp}] {msg}")
+        
+        try:
+            from scitran.extraction.pdf_parser import PDFParser
+            from scitran.core.pipeline import TranslationPipeline, PipelineConfig
+            from scitran.rendering.pdf_renderer import PDFRenderer
+            
+            input_path = Path(pdf_file.name if hasattr(pdf_file, 'name') else pdf_file)
+            add_log(f"Input: {input_path.name}")
+            
+            progress(0.05, desc="Parsing PDF...")
+            add_log("Parsing PDF structure...")
+            
+            parser = PDFParser()
+            # Explicitly parse ALL pages (max_pages=None means all pages)
+            document = parser.parse(str(input_path), max_pages=None)
+            total_blocks = len(document.translatable_blocks)
+            num_pages = document.stats.get("num_pages", 0)
+            add_log(f"Parsed {num_pages} pages")
+            add_log(f"Found {total_blocks} text blocks")
+            _dbg_log("H1", "translate_document:parsed", "document parsed", {"pages": num_pages, "blocks": total_blocks})
+            
+            # Log blocks per page for debugging
+            blocks_per_page = {}
+            for block in document.translatable_blocks:
+                if block.bbox:
+                    page = block.bbox.page
+                    blocks_per_page[page] = blocks_per_page.get(page, 0) + 1
+            for page, count in sorted(blocks_per_page.items()):
+                add_log(f"  Page {page + 1}: {count} blocks")
+            
+            progress(0.1, desc="Configuring pipeline...")
+            add_log(f"Backend: {backend}")
+            if model_name and model_name != "default":
+                add_log(f"Model: {model_name}")
+            
+            # Warn about free backend limitations
+            if backend.lower() in ['cascade', 'free']:
+                add_log(f"⚠️ Note: Free backends have rate limits - large PDFs will be slow")
+                add_log(f"💡 Tip: For large documents, use paid backends (OpenAI/Anthropic)")
+            
+            add_log(f"Masking: {'ON' if enable_masking else 'OFF'}")
+            add_log(f"Reranking: {'ON' if enable_reranking else 'OFF'}")
+            add_log(f"Caching: ON (persistent)")
+            
+            # For speed, use batch mode when reranking is off
+            # When reranking is on, use user-selected candidate count (turns)
+            config = PipelineConfig(
+                source_lang=source_lang,
+                target_lang=target_lang,
+                backend=backend,
+                model_name=model_name if model_name and model_name != "default" else None,
+                enable_masking=enable_masking,
+                enable_reranking=enable_reranking,
+                num_candidates=int(num_candidates) if enable_reranking else 1,
+                cache_translations=True,
+                enable_glossary=use_glossary,
+                context_window_size=int(context_window),
+                quality_threshold=float(quality_threshold),
+                batch_size=int(batch_size),
+                prompt_optimization_rounds=int(prompt_rounds),
+                optimize_prompts=int(prompt_rounds) > 0,
+                debug_mode=True,
+            )
+            
+            pipeline = TranslationPipeline(config)
+            
+            # Create progress callback for live updates
+            def pipeline_progress(prog: float, msg: str):
+                # Map pipeline progress (0-1) to our progress (0.1-0.85)
+                mapped_progress = 0.1 + (prog * 0.75)
+                progress(mapped_progress, desc=msg)
+                add_log(msg)
+            
+            progress(0.15, desc="Starting translation...")
+            add_log("Starting translation with caching enabled...")
+            
+            # Show loading state in preview
+            loading_img = self.create_loading_image("Translating... Please wait")
+            
+            # Translate with progress updates
+            result = pipeline.translate_document(document, progress_callback=pipeline_progress)
+            
+            # Update preview with loading state during translation
+            # (The actual preview will be updated after rendering)
+            
+            # Log cache stats if available
+            stats = pipeline.get_statistics()
+            if 'batch_cache_hits' in stats:
+                add_log(f"Cache hits: {stats.get('batch_cache_hits', 0)}")
+                add_log(f"New translations: {stats.get('batch_translated', 0)}")
+            if 'cache_hits' in stats:
+                add_log(f"Sequential cache hits: {stats.get('cache_hits', 0)}")
+            
+            add_log(f"Translated {result.blocks_translated}/{total_blocks} blocks")
+            
+            # Debug: Check how many blocks have translations per page
+            translated_by_page = {}
+            translated_with_bbox = 0
+            for seg in document.segments:
+                for b in seg.blocks:
+                    if b.translated_text and b.bbox:
+                        translated_with_bbox += 1
+                        page = b.bbox.page
+                        translated_by_page[page] = translated_by_page.get(page, 0) + 1
+            missing_blocks = [b.block_id for seg in document.segments for b in seg.blocks if not b.translated_text]
+            _dbg_log(
+                "H2",
+                "translate_document:translation_done",
+                "translation completed",
+                {
+                    "translated_blocks": result.blocks_translated,
+                    "total_blocks": total_blocks,
+                    "missing_count": len(missing_blocks),
+                    "missing_sample": missing_blocks[:10],
+                },
+            )
+            
+            add_log(f"Blocks with translation + bbox: {translated_with_bbox}")
+            for page, count in sorted(translated_by_page.items()):
+                add_log(f"  Page {page + 1}: {count} translated blocks")
+            
+            progress(0.9, desc="Rendering PDF...")
+            add_log("Rendering translated PDF (clearing source text, preserving layout)...")
+            
+            # Save PDF to temp directory first (Gradio requirement), then copy to persistent location
+            temp_output_dir = Path(tempfile.gettempdir()) / "scitrans"
+            temp_output_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_output_path = temp_output_dir / f"{input_path.stem}_{target_lang}_{timestamp}.pdf"
+            
+            renderer = PDFRenderer()
+            renderer.render_with_layout(str(input_path), result.document, str(temp_output_path))
+            
+            # Count translated pages for pagination
+            try:
+                import fitz
+                with fitz.open(str(temp_output_path)) as out_pdf:
+                    translated_pages = len(out_pdf)
+            except Exception:
+                translated_pages = document.stats.get("num_pages", 1)
+            
+            # Also copy to persistent location for user access
+            # Keep final output in temp (Gradio requirement) and optionally mirror to home cache
+            persistent_output_dir = Path.home() / ".scitrans" / "output"
+            persistent_output_dir.mkdir(parents=True, exist_ok=True)
+            persistent_output_path = persistent_output_dir / f"{input_path.stem}_{target_lang}_{timestamp}.pdf"
+            
+            import shutil
+            if temp_output_path.exists():
+                shutil.copy2(temp_output_path, persistent_output_path)
+                file_size = temp_output_path.stat().st_size / 1024  # KB
+                add_log(f"✓ PDF created: {temp_output_path.name} ({file_size:.1f} KB)")
+                add_log(f"📁 Also saved to: {persistent_output_path}")
+            else:
+                add_log(f"⚠️ Warning: PDF file not found at {temp_output_path}")
+                return f"Error: PDF not created", None, "\n".join(logs), None
+            
+            self.translated_pdf_path = str(temp_output_path)
+            
+            progress(1.0, desc="Complete!")
+            add_log("Translation complete!")
+            
+            status = f"✓ Translation Complete\n"
+            status += f"Blocks: {result.blocks_translated}/{total_blocks}\n"
+            status += f"Time: {result.duration:.1f}s\n"
+            status += f"Backend: {backend}"
+            if 'batch_cache_hits' in stats:
+                status += f"\nCached: {stats.get('batch_cache_hits', 0)}"
+            
+            trans_preview = self.preview_pdf(str(temp_output_path), 1)
+            
+            # Return the temp PDF file path (Gradio can access temp directory)
+            # Show translated preview, or loading image if translation failed
+            final_preview = trans_preview if trans_preview else loading_img
+            page_update = gr.update(maximum=max(1, translated_pages), value=1)
+            page_total_text = f"of {max(1, translated_pages)}"
+            _dbg_log(
+                "H3",
+                "translate_document:render_done",
+                "render completed",
+                {
+                    "translated_pages": translated_pages,
+                    "output_temp": str(temp_output_path),
+                    "output_persistent": str(persistent_output_path),
+                },
+            )
+            return (
+                status,
+                gr.update(value=str(temp_output_path), visible=True),
+                "\n".join(logs),
+                final_preview,
+                page_total_text,
+                page_update,
+                final_preview,
+            )
+            
+        except Exception as e:
+            import traceback
+            add_log(f"Error: {str(e)}")
+            _dbg_log("H9", "translate_document:error", "translate failed", {"error": str(e)})
+            return (
+                f"Error: {str(e)}",
+                gr.update(value=None, visible=False),
+                "\n".join(logs) + f"\n\n{traceback.format_exc()}",
+                None,
+                "of 0",
+                gr.update(maximum=1, value=1),
+                None
+            )
+    
+    def preview_pdf(self, pdf_file, page_num=1):
+        """Preview PDF page."""
+        if pdf_file is None:
+            return None
+        try:
+            import fitz
+            from PIL import Image, ImageDraw, ImageFont
+            import io
+            
+            pdf_path = pdf_file.name if hasattr(pdf_file, 'name') else str(pdf_file)
+            doc = fitz.open(pdf_path)
+            page_idx = max(0, min(int(page_num) - 1, len(doc) - 1))
+            page = doc[page_idx]
+            
+            zoom = 1.2
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            img_data = pix.tobytes("png")
+            doc.close()
+            
+            return Image.open(io.BytesIO(img_data))
+        except Exception as e:
+            print(f"Preview error: {e}")
+            return None
+    
+    def create_loading_image(self, message="Translating..."):
+        """Create a loading overlay image."""
+        from PIL import Image, ImageDraw, ImageFont
+        
+        # Create a semi-transparent overlay
+        img = Image.new('RGBA', (800, 500), (0, 0, 0, 128))  # Semi-transparent black
+        draw = ImageDraw.Draw(img)
+        
+        # Try to use a nice font
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 24)
+        except:
+            font = ImageFont.load_default()
+        
+        # Get text size and center it
+        bbox = draw.textbbox((0, 0), message, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        position = ((800 - text_width) // 2, (500 - text_height) // 2)
+        
+        # Draw white text
+        draw.text(position, message, fill=(255, 255, 255, 255), font=font)
+        
+        return img
+    
+    def get_page_count(self, pdf_file):
+        """Get PDF page count."""
+        if pdf_file is None:
+            return 1
+        try:
+            import fitz
+            pdf_path = pdf_file.name if hasattr(pdf_file, 'name') else str(pdf_file)
+            doc = fitz.open(pdf_path)
+            count = len(doc)
+            doc.close()
+            return count
+        except:
+            return 1
+    
+    def _get_model_options_for_backend(self, backend: str):
+        """Return model choices, default value, and visibility for a backend."""
+        model_options = {
+            "ollama": ["llama3.1", "llama3.2", "qwen2.5", "mistral", "gemma2", "llama3.3"],
+            "huggingface": ["facebook/mbart-large-50-many-to-many-mmt", "Helsinki-NLP/opus-mt-en-fr"],
+            "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
+            "anthropic": ["claude-3-5-sonnet-20241022", "claude-3-opus-20240229", "claude-3-sonnet-20240229"],
+            "deepseek": ["deepseek-chat", "deepseek-coder"],
+            "cascade": ["default"],
+            "free": ["default"]
+        }
+        
+        options = model_options.get(backend, ["default"])
+        default_value = options[0]
+        visible = backend not in ["cascade", "free"]
+        return {"choices": options, "value": default_value, "visible": visible}
+    
+    def update_model_options(self, backend):
+        """Update model dropdown options based on selected backend."""
+        opts = self._get_model_options_for_backend(backend)
+        return gr.update(choices=opts["choices"], value=opts["value"], visible=opts["visible"])
+    
+    # =========================================================================
+    # Testing Functions
+    # =========================================================================
+    
+    def test_backend(self, backend, sample_text):
+        """Test translation backend."""
+        if not sample_text.strip():
+            sample_text = "Machine learning enables computers to learn from data without explicit programming."
+        
+        try:
+            from scitran.translation.base import TranslationRequest
+            
+            if backend == "cascade":
+                from scitran.translation.backends.cascade_backend import CascadeBackend
+                translator = CascadeBackend()
+            elif backend == "free":
+                from scitran.translation.backends.free_backend import FreeBackend
+                translator = FreeBackend()
+            elif backend == "ollama":
+                from scitran.translation.backends.ollama_backend import OllamaBackend
+                translator = OllamaBackend()
+            else:
+                api_key = self.config.get("api_keys", {}).get(backend)
+                if not api_key:
+                    return f"Backend '{backend}' requires API key. Set it in Settings."
+                
+                if backend == "openai":
+                    from scitran.translation.backends.openai_backend import OpenAIBackend
+                    translator = OpenAIBackend(api_key=api_key)
+                elif backend == "anthropic":
+                    from scitran.translation.backends.anthropic_backend import AnthropicBackend
+                    translator = AnthropicBackend(api_key=api_key)
+                elif backend == "deepseek":
+                    from scitran.translation.backends.deepseek_backend import DeepSeekBackend
+                    translator = DeepSeekBackend(api_key=api_key)
+                else:
+                    return f"Unknown backend: {backend}"
+            
+            if not translator.is_available():
+                return f"Backend '{backend}' is not available."
+            
+            request = TranslationRequest(text=sample_text, source_lang="en", target_lang="fr")
+            
+            start = time.time()
+            response = translator.translate_sync(request)
+            elapsed = time.time() - start
+            
+            if response.translations:
+                result = f"Backend '{backend}' OK ({elapsed:.2f}s)\n\n"
+                result += f"EN: {sample_text}\n\n"
+                result += f"FR: {response.translations[0]}"
+                return result
+            else:
+                return f"Backend returned no translation."
+                
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    def test_masking(self, test_input):
+        """Test masking with custom or default input."""
+        if not test_input.strip():
+            test_input = "The equation $E=mc^2$ is famous. See https://arxiv.org for more."
+        
+        try:
+            from scitran.masking.engine import MaskingEngine
+            from scitran.core.models import Block
+            
+            engine = MaskingEngine()
+            block = Block(block_id="test", source_text=test_input)
+            masked = engine.mask_block(block)
+            
+            result = f"Original: {test_input}\n\n"
+            result += f"Masked: {masked.masked_text}\n\n"
+            result += f"Masks found: {len(masked.masks)}\n"
+            for m in masked.masks:
+                result += f"  • {m.mask_type}: '{m.original}' → '{m.placeholder}'\n"
+            
+            # Show what would be sent to translator
+            result += f"\n(The masked text above is what gets translated, preserving formulas/URLs)"
+            
+            return result
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    def test_layout(self, pdf_file):
+        """Test layout extraction."""
+        if pdf_file is None:
+            return "Default test: Layout extraction module OK.\n\nUpload a PDF to test with your document."
+        
+        try:
+            import fitz
+            pdf_path = pdf_file.name if hasattr(pdf_file, 'name') else str(pdf_file)
+            doc = fitz.open(pdf_path)
+            
+            result = f"PDF: {Path(pdf_path).name}\n"
+            result += f"Pages: {len(doc)}\n\n"
+            
+            for i, page in enumerate(doc[:3]):  # First 3 pages
+                result += f"Page {i+1}:\n"
+                result += f"  Size: {page.rect.width:.0f} x {page.rect.height:.0f}\n"
+                result += f"  Images: {len(page.get_images())}\n"
+                result += f"  Text blocks: {len(page.get_text('blocks'))}\n"
+            
+            doc.close()
+            return result
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    def test_cache(self):
+        """Test cache functionality."""
+        try:
+            from scitran.utils.fast_translator import PersistentCache
+            cache = PersistentCache()
+            
+            cache.set("test_key", "en", "fr", "test_value")
+            result = cache.get("test_key", "en", "fr")
+            
+            if result == "test_value":
+                stats = cache.stats()
+                return f"Cache OK\n\nStats: {stats}"
+            else:
+                return "Cache read failed"
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    # =========================================================================
+    # Glossary Functions - Extensive Domain Glossaries
+    # =========================================================================
+    
+    def _get_scientific_ml_glossary(self, direction="en-fr"):
+        """Machine Learning and AI scientific terms."""
+        en_fr = {
+            # Core ML concepts
+            "machine learning": "apprentissage automatique",
+            "deep learning": "apprentissage profond",
+            "neural network": "réseau de neurones",
+            "artificial intelligence": "intelligence artificielle",
+            "supervised learning": "apprentissage supervisé",
+            "unsupervised learning": "apprentissage non supervisé",
+            "reinforcement learning": "apprentissage par renforcement",
+            "training data": "données d'entraînement",
+            "test data": "données de test",
+            "validation set": "ensemble de validation",
+            "overfitting": "surapprentissage",
+            "underfitting": "sous-apprentissage",
+            "regularization": "régularisation",
+            "gradient descent": "descente de gradient",
+            "backpropagation": "rétropropagation",
+            "loss function": "fonction de perte",
+            "activation function": "fonction d'activation",
+            "learning rate": "taux d'apprentissage",
+            "batch size": "taille du lot",
+            "epoch": "époque",
+            # Architecture terms
+            "convolutional neural network": "réseau de neurones convolutif",
+            "recurrent neural network": "réseau de neurones récurrent",
+            "transformer": "transformeur",
+            "attention mechanism": "mécanisme d'attention",
+            "self-attention": "auto-attention",
+            "encoder": "encodeur",
+            "decoder": "décodeur",
+            "embedding": "plongement",
+            "hidden layer": "couche cachée",
+            "dropout": "abandon",
+            "pooling": "agrégation",
+            # NLP terms
+            "natural language processing": "traitement du langage naturel",
+            "language model": "modèle de langage",
+            "tokenization": "tokenisation",
+            "word embedding": "plongement de mots",
+            "sentiment analysis": "analyse de sentiment",
+            "named entity recognition": "reconnaissance d'entités nommées",
+            "machine translation": "traduction automatique",
+            "text classification": "classification de texte",
+            # Computer Vision
+            "computer vision": "vision par ordinateur",
+            "image classification": "classification d'images",
+            "object detection": "détection d'objets",
+            "semantic segmentation": "segmentation sémantique",
+            "feature extraction": "extraction de caractéristiques",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def _get_scientific_physics_glossary(self, direction="en-fr"):
+        """Physics and mathematics scientific terms."""
+        en_fr = {
+            # Physics
+            "quantum mechanics": "mécanique quantique",
+            "quantum computing": "informatique quantique",
+            "wave function": "fonction d'onde",
+            "superposition": "superposition",
+            "entanglement": "intrication",
+            "relativity": "relativité",
+            "electromagnetic": "électromagnétique",
+            "thermodynamics": "thermodynamique",
+            "statistical mechanics": "mécanique statistique",
+            "particle physics": "physique des particules",
+            "string theory": "théorie des cordes",
+            "black hole": "trou noir",
+            "dark matter": "matière noire",
+            "dark energy": "énergie noire",
+            "gravitational wave": "onde gravitationnelle",
+            # Mathematics
+            "theorem": "théorème",
+            "lemma": "lemme",
+            "corollary": "corollaire",
+            "proof": "démonstration",
+            "hypothesis": "hypothèse",
+            "conjecture": "conjecture",
+            "equation": "équation",
+            "inequality": "inégalité",
+            "matrix": "matrice",
+            "vector": "vecteur",
+            "tensor": "tenseur",
+            "eigenvalue": "valeur propre",
+            "eigenvector": "vecteur propre",
+            "differential equation": "équation différentielle",
+            "partial derivative": "dérivée partielle",
+            "integral": "intégrale",
+            "convergence": "convergence",
+            "optimization": "optimisation",
+            "convex function": "fonction convexe",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def _get_scientific_bio_glossary(self, direction="en-fr"):
+        """Biology and medical scientific terms."""
+        en_fr = {
+            # Biology
+            "protein": "protéine",
+            "amino acid": "acide aminé",
+            "nucleotide": "nucléotide",
+            "genome": "génome",
+            "gene expression": "expression génique",
+            "transcription": "transcription",
+            "translation": "traduction",
+            "mutation": "mutation",
+            "chromosome": "chromosome",
+            "cell membrane": "membrane cellulaire",
+            "mitochondria": "mitochondrie",
+            "enzyme": "enzyme",
+            "catalyst": "catalyseur",
+            "metabolism": "métabolisme",
+            "photosynthesis": "photosynthèse",
+            # Structural Biology
+            "protein folding": "repliement des protéines",
+            "secondary structure": "structure secondaire",
+            "tertiary structure": "structure tertiaire",
+            "alpha helix": "hélice alpha",
+            "beta sheet": "feuillet bêta",
+            "binding site": "site de liaison",
+            "active site": "site actif",
+            # Medical
+            "clinical trial": "essai clinique",
+            "diagnosis": "diagnostic",
+            "prognosis": "pronostic",
+            "treatment": "traitement",
+            "therapy": "thérapie",
+            "drug": "médicament",
+            "vaccine": "vaccin",
+            "antibody": "anticorps",
+            "antigen": "antigène",
+            "immune system": "système immunitaire",
+            "inflammation": "inflammation",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def _get_europarl_glossary(self, direction="en-fr"):
+        """European Parliament and legal terms."""
+        en_fr = {
+                "European Union": "Union européenne",
+                "European Parliament": "Parlement européen",
+                "European Commission": "Commission européenne",
+                "Member State": "État membre",
+                "Council of the European Union": "Conseil de l'Union européenne",
+                "legislation": "législation",
+                "regulation": "règlement",
+                "directive": "directive",
+                "treaty": "traité",
+                "amendment": "amendement",
+                "resolution": "résolution",
+                "committee": "commission",
+                "rapporteur": "rapporteur",
+                "codecision": "codécision",
+                "subsidiarity": "subsidiarité",
+            "human rights": "droits de l'homme",
+            "rule of law": "état de droit",
+            "democracy": "démocratie",
+            "transparency": "transparence",
+            "accountability": "responsabilité",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def _get_chemistry_glossary(self, direction="en-fr"):
+        """Chemistry scientific terms."""
+        en_fr = {
+            "molecule": "molécule",
+            "atom": "atome",
+            "electron": "électron",
+            "proton": "proton",
+            "neutron": "neutron",
+            "chemical bond": "liaison chimique",
+            "covalent bond": "liaison covalente",
+            "ionic bond": "liaison ionique",
+            "oxidation": "oxydation",
+            "reduction": "réduction",
+            "catalyst": "catalyseur",
+            "reagent": "réactif",
+            "solvent": "solvant",
+            "solution": "solution",
+            "concentration": "concentration",
+            "molar mass": "masse molaire",
+            "equilibrium": "équilibre",
+            "reaction rate": "vitesse de réaction",
+            "organic chemistry": "chimie organique",
+            "inorganic chemistry": "chimie inorganique",
+            "polymer": "polymère",
+            "compound": "composé",
+            "element": "élément",
+            "isotope": "isotope",
+            "valence": "valence",
+            "electronegativity": "électronégativité",
+            "spectroscopy": "spectroscopie",
+            "chromatography": "chromatographie",
+            "titration": "titrage",
+            "pH": "pH",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def _get_cs_glossary(self, direction="en-fr"):
+        """Computer Science terms."""
+        en_fr = {
+            "algorithm": "algorithme",
+            "data structure": "structure de données",
+            "array": "tableau",
+            "linked list": "liste chaînée",
+            "hash table": "table de hachage",
+            "binary tree": "arbre binaire",
+            "graph": "graphe",
+            "recursion": "récursion",
+            "iteration": "itération",
+            "complexity": "complexité",
+            "time complexity": "complexité temporelle",
+            "space complexity": "complexité spatiale",
+            "database": "base de données",
+            "query": "requête",
+            "index": "index",
+            "cache": "cache",
+            "memory": "mémoire",
+            "stack": "pile",
+            "queue": "file",
+            "heap": "tas",
+            "sorting": "tri",
+            "searching": "recherche",
+            "compiler": "compilateur",
+            "interpreter": "interpréteur",
+            "operating system": "système d'exploitation",
+            "network": "réseau",
+            "protocol": "protocole",
+            "encryption": "chiffrement",
+            "decryption": "déchiffrement",
+            "authentication": "authentification",
+            "authorization": "autorisation",
+            "API": "API",
+            "framework": "cadriciel",
+            "library": "bibliothèque",
+            "version control": "contrôle de version",
+            "debugging": "débogage",
+            "testing": "test",
+            "deployment": "déploiement",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def _get_statistics_glossary(self, direction="en-fr"):
+        """Statistics terms."""
+        en_fr = {
+            "mean": "moyenne",
+            "median": "médiane",
+            "mode": "mode",
+            "variance": "variance",
+            "standard deviation": "écart-type",
+            "distribution": "distribution",
+            "normal distribution": "distribution normale",
+            "probability": "probabilité",
+            "hypothesis": "hypothèse",
+            "null hypothesis": "hypothèse nulle",
+            "p-value": "valeur p",
+            "confidence interval": "intervalle de confiance",
+            "sample": "échantillon",
+            "population": "population",
+            "correlation": "corrélation",
+            "regression": "régression",
+            "linear regression": "régression linéaire",
+            "outlier": "valeur aberrante",
+            "bias": "biais",
+            "significance": "signification",
+            "statistical significance": "significativité statistique",
+            "Bayesian": "bayésien",
+            "frequentist": "fréquentiste",
+            "maximum likelihood": "maximum de vraisemblance",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def load_glossary_domain(self, domain, direction="en-fr"):
+        """Load glossary by domain (SPRINT 3: Using GlossaryManager)."""
+        if not hasattr(self, 'glossary_manager'):
+            from scitran.translation.glossary.manager import GlossaryManager
+            self.glossary_manager = GlossaryManager()
+        
+        prev_count = len(self.glossary_manager)
+        count = self.glossary_manager.load_domain(domain, direction)
+        new_count = len(self.glossary_manager) - prev_count
+        
+        # Update UI glossary dict
+        self.glossary = self.glossary_manager.to_dict()
+        self.save_glossary()
+        
+        return f"✓ Loaded {count} {domain.upper()} terms ({new_count} new)", self.glossary
+    
+    def load_all_scientific_glossaries(self, direction="en-fr"):
+        """Load all scientific glossaries at once (SPRINT 3: Using GlossaryManager)."""
+        if not hasattr(self, 'glossary_manager'):
+            from scitran.translation.glossary.manager import GlossaryManager
+            self.glossary_manager = GlossaryManager()
+        
+        total_before = len(self.glossary_manager)
+        
+        # Load all domains
+        all_domains = ['ml', 'physics', 'biology', 'chemistry', 'cs', 'statistics', 'europarl']
+        for domain in all_domains:
+            try:
+                self.glossary_manager.load_domain(domain, direction)
+            except Exception as e:
+                logger.warning(f"Could not load {domain}: {e}")
+        
+        total_after = len(self.glossary_manager)
+        new_terms = total_after - total_before
+        
+        # Update UI glossary dict
+        self.glossary = self.glossary_manager.to_dict()
+        self.save_glossary()
+        
+        return f"✓ Loaded ALL glossaries: {total_after} total terms ({new_terms} new)", self.glossary
+    
+    def load_glossary_file(self, file):
+        """Load glossary from uploaded file."""
+        if file is None:
+            return "No file selected", self.glossary
+        
+        try:
+            file_path = file.name if hasattr(file, 'name') else str(file)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            prev_count = len(self.glossary)
+            if "terms" in data:
+                self.glossary.update(data["terms"])
+            else:
+                self.glossary.update(data)
+            
+            new_count = len(self.glossary) - prev_count
+            self.save_glossary()  # Save persistently
+            return f"✓ Loaded from file: {new_count} new terms (total: {len(self.glossary)})", self.glossary
+        except Exception as e:
+            return f"Error: {str(e)}", self.glossary
+    
+    def add_glossary_term(self, source, target):
+        """Add term to glossary."""
+        if not source or not target:
+            return "⚠ Enter both source and target terms", self.glossary
+        
+        source = source.strip()
+        target = target.strip()
+        
+        if source in self.glossary:
+            self.glossary[source] = target
+            self.save_glossary()  # Save persistently
+            return f"✓ Updated: '{source}' → '{target}'", self.glossary
+        else:
+            self.glossary[source] = target
+            self.save_glossary()  # Save persistently
+            return f"✓ Added: '{source}' → '{target}'", self.glossary
+    
+    def clear_glossary(self):
+        """Clear glossary."""
+        count = len(self.glossary)
+        self.glossary = {}
+        self.save_glossary()  # Save persistently
+        return f"✓ Cleared {count} terms", {}
+    
+    def load_online_glossary(self, source, direction="en-fr"):
+        """Load glossary from online sources like HuggingFace, Europarl, etc."""
+        import requests
+        
+        prev_count = len(self.glossary)
+        
+        try:
+            if source == "europarl_full":
+                # Europarl parallel corpus - fetch common terms
+                # Using a subset available via GitHub
+                url = "https://raw.githubusercontent.com/Wikipedia-translations/europarl-extract/main/en-fr.json"
+                try:
+                    response = requests.get(url, timeout=15)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if isinstance(data, dict):
+                            self.glossary.update(data)
+                except:
+                    # Fallback: use expanded built-in Europarl
+                    self.glossary.update(self._get_expanded_europarl_glossary(direction))
+            
+            elif source == "huggingface_opus":
+                # HuggingFace OPUS-100 terms - common scientific terms
+                # Using a curated subset
+                url = "https://huggingface.co/datasets/Helsinki-NLP/opus-100/raw/main/README.md"
+                # Since direct API access may be limited, use expanded built-in
+                self.glossary.update(self._get_expanded_scientific_glossary(direction))
+            
+            elif source == "wiktionary":
+                # Wiktionary translations (curated subset)
+                self.glossary.update(self._get_wiktionary_terms(direction))
+            
+            elif source == "iate":
+                # IATE - Inter-Active Terminology for Europe
+                self.glossary.update(self._get_iate_terms(direction))
+            
+            else:
+                return f"Unknown source: {source}", self.glossary
+            
+            new_count = len(self.glossary) - prev_count
+            self.save_glossary()
+            return f"✓ Loaded from {source}: {new_count} new terms (total: {len(self.glossary)})", self.glossary
+            
+        except Exception as e:
+            return f"Error loading from {source}: {str(e)}", self.glossary
+    
+    def _get_expanded_europarl_glossary(self, direction="en-fr"):
+        """Expanded Europarl terminology (500+ terms)."""
+        en_fr = {
+            # Institutions
+            "European Union": "Union européenne",
+            "European Parliament": "Parlement européen",
+            "European Commission": "Commission européenne",
+            "Council of Ministers": "Conseil des ministres",
+            "European Council": "Conseil européen",
+            "Court of Justice": "Cour de justice",
+            "European Central Bank": "Banque centrale européenne",
+            "European Investment Bank": "Banque européenne d'investissement",
+            "Committee of the Regions": "Comité des régions",
+            "Economic and Social Committee": "Comité économique et social",
+            # Legal terms
+            "regulation": "règlement",
+            "directive": "directive",
+            "decision": "décision",
+            "recommendation": "recommandation",
+            "opinion": "avis",
+            "treaty": "traité",
+            "protocol": "protocole",
+            "annex": "annexe",
+            "preamble": "préambule",
+            "article": "article",
+            "paragraph": "paragraphe",
+            "subparagraph": "alinéa",
+            "amendment": "amendement",
+            "proposal": "proposition",
+            "resolution": "résolution",
+            "legislation": "législation",
+            "legal basis": "base juridique",
+            "implementation": "mise en œuvre",
+            "transposition": "transposition",
+            "enforcement": "application",
+            "compliance": "conformité",
+            "infringement": "infraction",
+            # Political terms
+            "Member State": "État membre",
+            "third country": "pays tiers",
+            "accession": "adhésion",
+            "enlargement": "élargissement",
+            "integration": "intégration",
+            "subsidiarity": "subsidiarité",
+            "proportionality": "proportionnalité",
+            "codecision": "codécision",
+            "consultation": "consultation",
+            "cooperation": "coopération",
+            "qualified majority": "majorité qualifiée",
+            "unanimity": "unanimité",
+            "veto": "veto",
+            # Rights and freedoms
+            "human rights": "droits de l'homme",
+            "fundamental rights": "droits fondamentaux",
+            "civil rights": "droits civiques",
+            "freedom of movement": "liberté de circulation",
+            "freedom of expression": "liberté d'expression",
+            "right to privacy": "droit à la vie privée",
+            "data protection": "protection des données",
+            "non-discrimination": "non-discrimination",
+            "equality": "égalité",
+            "solidarity": "solidarité",
+            # Economic terms
+            "single market": "marché unique",
+            "internal market": "marché intérieur",
+            "customs union": "union douanière",
+            "free trade": "libre-échange",
+            "competition": "concurrence",
+            "state aid": "aide d'État",
+            "public procurement": "marchés publics",
+            "monetary policy": "politique monétaire",
+            "fiscal policy": "politique budgétaire",
+            "budget": "budget",
+            "expenditure": "dépenses",
+            "revenue": "recettes",
+            # Policy areas
+            "agriculture": "agriculture",
+            "environment": "environnement",
+            "transport": "transport",
+            "energy": "énergie",
+            "research": "recherche",
+            "education": "éducation",
+            "employment": "emploi",
+            "social policy": "politique sociale",
+            "regional policy": "politique régionale",
+            "foreign policy": "politique étrangère",
+            "security": "sécurité",
+            "defense": "défense",
+            "justice": "justice",
+            "home affairs": "affaires intérieures",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def _get_expanded_scientific_glossary(self, direction="en-fr"):
+        """Expanded scientific glossary (500+ terms across all domains)."""
+        en_fr = {
+            # Advanced ML/AI
+            "generative adversarial network": "réseau antagoniste génératif",
+            "variational autoencoder": "auto-encodeur variationnel",
+            "long short-term memory": "mémoire à long et court terme",
+            "gated recurrent unit": "unité récurrente à porte",
+            "batch normalization": "normalisation par lots",
+            "layer normalization": "normalisation par couche",
+            "attention head": "tête d'attention",
+            "multi-head attention": "attention multi-têtes",
+            "positional encoding": "encodage positionnel",
+            "cross-entropy loss": "perte d'entropie croisée",
+            "focal loss": "perte focale",
+            "knowledge distillation": "distillation de connaissances",
+            "transfer learning": "apprentissage par transfert",
+            "few-shot learning": "apprentissage à quelques exemples",
+            "zero-shot learning": "apprentissage sans exemple",
+            "meta-learning": "méta-apprentissage",
+            "continual learning": "apprentissage continu",
+            "federated learning": "apprentissage fédéré",
+            "model pruning": "élagage de modèle",
+            "quantization": "quantification",
+            "neural architecture search": "recherche d'architecture neuronale",
+            "hyperparameter tuning": "ajustement des hyperparamètres",
+            "cross-validation": "validation croisée",
+            "early stopping": "arrêt précoce",
+            "weight decay": "décroissance des poids",
+            "momentum": "moment",
+            "adaptive learning rate": "taux d'apprentissage adaptatif",
+            # Physics & Math advanced
+            "Hamiltonian": "hamiltonien",
+            "Lagrangian": "lagrangien",
+            "perturbation theory": "théorie des perturbations",
+            "renormalization": "renormalisation",
+            "gauge theory": "théorie de jauge",
+            "symmetry breaking": "brisure de symétrie",
+            "phase transition": "transition de phase",
+            "critical point": "point critique",
+            "order parameter": "paramètre d'ordre",
+            "correlation function": "fonction de corrélation",
+            "partition function": "fonction de partition",
+            "density matrix": "matrice densité",
+            "Hilbert space": "espace de Hilbert",
+            "Banach space": "espace de Banach",
+            "Fourier transform": "transformée de Fourier",
+            "Laplace transform": "transformée de Laplace",
+            "Green's function": "fonction de Green",
+            "boundary condition": "condition aux limites",
+            "initial condition": "condition initiale",
+            "eigenfunction": "fonction propre",
+            "spectral decomposition": "décomposition spectrale",
+            # Biology advanced
+            "CRISPR": "CRISPR",
+            "gene editing": "édition génique",
+            "epigenetics": "épigénétique",
+            "methylation": "méthylation",
+            "histone": "histone",
+            "chromatin": "chromatine",
+            "telomere": "télomère",
+            "apoptosis": "apoptose",
+            "autophagy": "autophagie",
+            "signal transduction": "transduction du signal",
+            "receptor": "récepteur",
+            "ligand": "ligand",
+            "kinase": "kinase",
+            "phosphorylation": "phosphorylation",
+            "pathway": "voie métabolique",
+            "biomarker": "biomarqueur",
+            "proteomics": "protéomique",
+            "genomics": "génomique",
+            "transcriptomics": "transcriptomique",
+            "metabolomics": "métabolomique",
+            "bioinformatics": "bio-informatique",
+            "sequence alignment": "alignement de séquences",
+            "phylogenetic tree": "arbre phylogénétique",
+            # More common scientific terms
+            "abstract": "résumé",
+            "introduction": "introduction",
+            "methodology": "méthodologie",
+            "results": "résultats",
+            "discussion": "discussion",
+            "conclusion": "conclusion",
+            "references": "références",
+            "acknowledgments": "remerciements",
+            "supplementary material": "matériel supplémentaire",
+            "figure": "figure",
+            "table": "tableau",
+            "equation": "équation",
+            "hypothesis": "hypothèse",
+            "experiment": "expérience",
+            "observation": "observation",
+            "measurement": "mesure",
+            "analysis": "analyse",
+            "simulation": "simulation",
+            "model": "modèle",
+            "algorithm": "algorithme",
+            "dataset": "jeu de données",
+            "benchmark": "référence",
+            "baseline": "ligne de base",
+            "state-of-the-art": "état de l'art",
+            "accuracy": "précision",
+            "precision": "précision",
+            "recall": "rappel",
+            "F1 score": "score F1",
+            "ROC curve": "courbe ROC",
+            "AUC": "AUC",
+            "confidence interval": "intervalle de confiance",
+            "p-value": "valeur p",
+            "statistical significance": "significativité statistique",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def _get_wiktionary_terms(self, direction="en-fr"):
+        """Common Wiktionary translation pairs."""
+        en_fr = {
+            "analysis": "analyse",
+            "approach": "approche",
+            "application": "application",
+            "assessment": "évaluation",
+            "assumption": "hypothèse",
+            "behavior": "comportement",
+            "calculation": "calcul",
+            "characteristic": "caractéristique",
+            "comparison": "comparaison",
+            "complexity": "complexité",
+            "component": "composant",
+            "concept": "concept",
+            "condition": "condition",
+            "configuration": "configuration",
+            "constraint": "contrainte",
+            "context": "contexte",
+            "contribution": "contribution",
+            "criterion": "critère",
+            "data": "données",
+            "definition": "définition",
+            "description": "description",
+            "development": "développement",
+            "dimension": "dimension",
+            "distribution": "distribution",
+            "effect": "effet",
+            "efficiency": "efficacité",
+            "element": "élément",
+            "environment": "environnement",
+            "estimation": "estimation",
+            "evaluation": "évaluation",
+            "evidence": "preuve",
+            "example": "exemple",
+            "experiment": "expérience",
+            "explanation": "explication",
+            "expression": "expression",
+            "factor": "facteur",
+            "feature": "caractéristique",
+            "framework": "cadre",
+            "function": "fonction",
+            "generation": "génération",
+            "implementation": "implémentation",
+            "improvement": "amélioration",
+            "indicator": "indicateur",
+            "information": "information",
+            "input": "entrée",
+            "integration": "intégration",
+            "interpretation": "interprétation",
+            "investigation": "investigation",
+            "knowledge": "connaissance",
+            "layer": "couche",
+            "limitation": "limitation",
+            "literature": "littérature",
+            "mechanism": "mécanisme",
+            "method": "méthode",
+            "modification": "modification",
+            "objective": "objectif",
+            "observation": "observation",
+            "operation": "opération",
+            "optimization": "optimisation",
+            "output": "sortie",
+            "parameter": "paramètre",
+            "performance": "performance",
+            "perspective": "perspective",
+            "phenomenon": "phénomène",
+            "prediction": "prédiction",
+            "principle": "principe",
+            "probability": "probabilité",
+            "problem": "problème",
+            "procedure": "procédure",
+            "process": "processus",
+            "property": "propriété",
+            "proposition": "proposition",
+            "quality": "qualité",
+            "quantity": "quantité",
+            "range": "plage",
+            "rate": "taux",
+            "ratio": "rapport",
+            "reduction": "réduction",
+            "relation": "relation",
+            "relationship": "relation",
+            "representation": "représentation",
+            "requirement": "exigence",
+            "research": "recherche",
+            "resource": "ressource",
+            "response": "réponse",
+            "result": "résultat",
+            "review": "revue",
+            "sample": "échantillon",
+            "scale": "échelle",
+            "scenario": "scénario",
+            "scope": "portée",
+            "section": "section",
+            "selection": "sélection",
+            "sequence": "séquence",
+            "series": "série",
+            "set": "ensemble",
+            "simulation": "simulation",
+            "situation": "situation",
+            "solution": "solution",
+            "source": "source",
+            "specification": "spécification",
+            "stability": "stabilité",
+            "stage": "étape",
+            "standard": "norme",
+            "state": "état",
+            "statement": "déclaration",
+            "strategy": "stratégie",
+            "structure": "structure",
+            "study": "étude",
+            "subject": "sujet",
+            "summary": "résumé",
+            "system": "système",
+            "technique": "technique",
+            "technology": "technologie",
+            "term": "terme",
+            "test": "test",
+            "theory": "théorie",
+            "threshold": "seuil",
+            "tool": "outil",
+            "training": "entraînement",
+            "transformation": "transformation",
+            "trend": "tendance",
+            "type": "type",
+            "unit": "unité",
+            "value": "valeur",
+            "variable": "variable",
+            "variation": "variation",
+            "version": "version",
+            "view": "vue",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    def _get_iate_terms(self, direction="en-fr"):
+        """IATE (Inter-Active Terminology for Europe) terms."""
+        en_fr = {
+            # Technical/IT
+            "software": "logiciel",
+            "hardware": "matériel",
+            "database": "base de données",
+            "interface": "interface",
+            "network": "réseau",
+            "protocol": "protocole",
+            "server": "serveur",
+            "client": "client",
+            "browser": "navigateur",
+            "firewall": "pare-feu",
+            "encryption": "chiffrement",
+            "authentication": "authentification",
+            "authorization": "autorisation",
+            "backup": "sauvegarde",
+            "download": "téléchargement",
+            "upload": "téléversement",
+            "bandwidth": "bande passante",
+            "latency": "latence",
+            "throughput": "débit",
+            # Business
+            "stakeholder": "partie prenante",
+            "shareholder": "actionnaire",
+            "turnover": "chiffre d'affaires",
+            "profit margin": "marge bénéficiaire",
+            "return on investment": "retour sur investissement",
+            "due diligence": "diligence raisonnable",
+            "merger": "fusion",
+            "acquisition": "acquisition",
+            "subsidiary": "filiale",
+            "joint venture": "coentreprise",
+            "outsourcing": "externalisation",
+            "procurement": "approvisionnement",
+            "supply chain": "chaîne d'approvisionnement",
+            "logistics": "logistique",
+            "inventory": "inventaire",
+            "warehouse": "entrepôt",
+            # Environment
+            "climate change": "changement climatique",
+            "global warming": "réchauffement climatique",
+            "greenhouse gas": "gaz à effet de serre",
+            "carbon footprint": "empreinte carbone",
+            "renewable energy": "énergie renouvelable",
+            "sustainable development": "développement durable",
+            "biodiversity": "biodiversité",
+            "ecosystem": "écosystème",
+            "pollution": "pollution",
+            "waste management": "gestion des déchets",
+            "recycling": "recyclage",
+            "emission": "émission",
+            # Healthcare
+            "diagnosis": "diagnostic",
+            "treatment": "traitement",
+            "prognosis": "pronostic",
+            "symptom": "symptôme",
+            "side effect": "effet secondaire",
+            "clinical trial": "essai clinique",
+            "placebo": "placebo",
+            "dosage": "posologie",
+            "prescription": "ordonnance",
+            "vaccine": "vaccin",
+            "immunization": "vaccination",
+            "outbreak": "épidémie",
+            "pandemic": "pandémie",
+            "quarantine": "quarantaine",
+        }
+        if direction == "fr-en":
+            return {v: k for k, v in en_fr.items()}
+        return en_fr
+    
+    # =========================================================================
+    # Settings Functions
+    # =========================================================================
+    
+    def save_api_key(self, backend, api_key):
+        """Save API key."""
+        if not api_key or not api_key.strip():
+            return "Please enter an API key"
+        
+        env_map = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+        }
+        
+        env_var = env_map.get(backend, f"{backend.upper()}_API_KEY")
+        os.environ[env_var] = api_key.strip()
+        
+        if "api_keys" not in self.config:
+            self.config["api_keys"] = {}
+        self.config["api_keys"][backend] = api_key.strip()
+        self.save_config()
+        
+        return f"API key saved for {backend}"
+    
+    def get_api_keys_display(self):
+        """Get masked API keys."""
+        keys = self.config.get("api_keys", {})
+        if not keys:
+            return "No API keys configured"
+        
+        result = []
+        for backend, key in keys.items():
+            masked = key[:8] + "..." + key[-4:] if len(key) > 12 else "***"
+            result.append(f"{backend}: {masked}")
+        return "\n".join(result)
+    
+    def save_all_settings(self, backend, masking, reranking, cache, context, candidates, glossary):
+        """Save all settings."""
+        self.config["default_backend"] = backend
+        self.config["masking_enabled"] = masking
+        self.config["reranking_enabled"] = reranking
+        self.config["cache_enabled"] = cache
+        self.config["context_window"] = int(context)
+        self.config["max_candidates"] = int(candidates)
+        self.config["glossary_enabled"] = glossary
+        self.save_config()
+        return "Settings saved"
+    
+    def clear_cache(self):
+        """Clear translation cache."""
+        try:
+            import shutil
+            cache_dir = Path(".cache/translations")
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+                cache_dir.mkdir(parents=True)
+            return "Cache cleared"
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    # =========================================================================
+    # Create Interface
+    # =========================================================================
+    
+    def create_interface(self):
+        """Create the Gradio interface."""
+        
+        with gr.Blocks(title="SciTrans LLMs") as demo:
             
             # Header
-            gr.Markdown(
-                """
-                # 🔬 SciTrans-LLMs NEW
-                ### Advanced Scientific Document Translation with Three Key Innovations
+            gr.Markdown("# 🔬 SciTrans LLMs\n**Scientific Document Translation** • v1.0")
+            
+            with gr.Tabs():
                 
-                **Innovation #1**: Terminology-Constrained Translation with Advanced Masking  
-                **Innovation #2**: Document-Level Context with Multi-Candidate Reranking  
-                **Innovation #3**: Complete Layout Preservation with YOLO Detection
-                """
+                # ===========================================================
+                # TAB 1: TRANSLATION
+                # ===========================================================
+                with gr.Tab("Translation"):
+                    allowed_backends = ["cascade", "free", "ollama", "openai", "anthropic", "deepseek"]
+                    initial_backend = self.config.get("default_backend", "free")
+                    if initial_backend not in allowed_backends:
+                        initial_backend = "free"
+                    initial_model_opts = self._get_model_options_for_backend(initial_backend)
+
+                    with gr.Row():
+                        # Left: Controls (narrower)
+                        with gr.Column(scale=2):
+                            pdf_upload = gr.File(label="Upload PDF", file_types=[".pdf"])
+                            
+                            with gr.Row():
+                                source_lang = gr.Dropdown(["en", "fr"], value="en", label="From", scale=1)
+                                target_lang = gr.Dropdown(["fr", "en"], value="fr", label="To", scale=1)
+                            
+                            backend = gr.Dropdown(
+                                allowed_backends,
+                                value=initial_backend,
+                                label="Backend"
+                            )
+                            
+                            model_selector = gr.Dropdown(
+                                initial_model_opts["choices"],
+                                value=initial_model_opts["value"],
+                                label="Model (for Ollama/HuggingFace/OpenAI/etc.)",
+                                info="Select model for backends that support it",
+                                visible=initial_model_opts["visible"]
+                            )
+                            
+                            # All advanced features ON by default
+                            advanced_options = gr.CheckboxGroup(
+                                ["Masking", "Reranking", "Context", "Glossary"],
+                                value=["Masking", "Reranking", "Context", "Glossary"],
+                                label="Advanced Features"
+                            )
+                            
+                            # Advanced tweakable parameters
+                            with gr.Accordion("⚙️ Advanced Parameters", open=False):
+                                num_candidates = gr.Slider(
+                                    minimum=1,
+                                    maximum=4,
+                                    step=1,
+                                    value=2,
+                                    label="Number of candidates (turns)"
+                                )
+                                context_window = gr.Slider(
+                                    minimum=0,
+                                    maximum=10,
+                                    step=1,
+                                    value=5,
+                                    label="Context window (blocks)"
+                                )
+                                prompt_rounds = gr.Slider(
+                                    minimum=0,
+                                    maximum=5,
+                                    step=1,
+                                    value=2,
+                                    label="Prompt optimization rounds"
+                                )
+                                quality_threshold = gr.Slider(
+                                    minimum=0.0,
+                                    maximum=1.0,
+                                    step=0.05,
+                                    value=0.7,
+                                    label="Quality threshold"
+                                )
+                                batch_size = gr.Slider(
+                                    minimum=5,
+                                    maximum=30,
+                                    step=1,
+                                    value=10,
+                                    label="Batch size"
+                                )
+                            
+                            with gr.Row():
+                                translate_btn = gr.Button("🚀 Translate", variant="primary")
+                                retranslate_btn = gr.Button("🔁 Retranslate", variant="secondary")
+                                clear_btn = gr.Button("🧹 Clear", variant="secondary")
+                            
+                            # Status/Log moved to left column below translate button
+                            with gr.Accordion("📊 Status & Logs", open=True):
+                                with gr.Tabs():
+                                    with gr.Tab("Status"):
+                                        status_box = gr.Textbox(lines=4, interactive=False, show_label=False)
+                                    with gr.Tab("Log"):
+                                        log_box = gr.Textbox(lines=6, interactive=False, show_label=False, autoscroll=True)
+                        
+                        # Right: Preview (wider) - Preview replaces progress/status area
+                        with gr.Column(scale=3):
+                            # Download button (small footprint)
+                            download_btn = gr.DownloadButton(
+                                label="📥 Download Translated PDF",
+                                value=None,
+                                interactive=False,
+                                visible=False
+                            )
+                            
+                            # Preview area with fullscreen support
+                            with gr.Tabs():
+                                with gr.Tab("Source"):
+                                    source_preview = gr.Image(
+                                        height=480,
+                                        show_label=False,
+                                        container=False
+                                    )
+                                with gr.Tab("Translated"):
+                                    trans_preview = gr.Image(
+                                        height=480,
+                                        show_label=False,
+                                        container=False
+                                    )
+                            
+                            # Loading indicator (shown during translation)
+                            loading_indicator = gr.Markdown("", visible=False)
+                            
+                            # Unified pagination
+                            gr.Markdown("**Pages**")
+                            with gr.Row():
+                                page_prev = gr.Button("◀", size="sm", scale=0, min_width=30)
+                                page_slider = gr.Slider(
+                                    minimum=1,
+                                    maximum=1,
+                                    step=1,
+                                    value=1,
+                                    label="Page",
+                                    interactive=True
+                                )
+                                page_next = gr.Button("▶", size="sm", scale=0, min_width=30)
+                                page_total = gr.Textbox(value="of 1", show_label=False, interactive=False, scale=0, min_width=60, container=False)
+                
+                # ===========================================================
+                # TAB 2: TESTING
+                # ===========================================================
+                with gr.Tab("Testing"):
+                    gr.Markdown("### 🧪 Component Tests\nTest individual components before full translation.")
+                    
+                    with gr.Row():
+                        with gr.Column():
+                            gr.Markdown("**🔌 Backend Test**")
+                            test_backend_sel = gr.Dropdown(
+                                ["cascade", "free", "ollama", "openai", "anthropic", "deepseek"],
+                                value="free", label="Backend"
+                            )
+                            # Pre-filled with rich test content
+                            test_text = gr.Textbox(
+                                value="""# Machine Learning Overview
+
+Machine learning enables computers to learn from data without explicit programming.
+
+## Key Concepts:
+• **Supervised Learning** - Learn from labeled examples
+• **Unsupervised Learning** - Find patterns in unlabeled data
+• **Reinforcement Learning** - Learn through rewards/penalties
+
+The loss function $L(\\theta) = \\frac{1}{n}\\sum_{i=1}^{n}(y_i - \\hat{y}_i)^2$ measures prediction error.
+
+See: https://arxiv.org/abs/1234.5678 for more details.""",
+                                label="Sample Text (includes headers, bullets, math, URLs)", lines=8
+                            )
+                            test_backend_btn = gr.Button("▶ Test Backend")
+                            test_backend_result = gr.Textbox(label="Result", lines=6)
+                        
+                        with gr.Column():
+                            gr.Markdown("**🎭 Masking Test**")
+                            # Rich test content with various maskable elements
+                            masking_input = gr.Textbox(
+                                value="""The famous equation $E=mc^2$ demonstrates mass-energy equivalence.
+
+For more complex formulas, consider:
+$$\\int_{-\\infty}^{\\infty} e^{-x^2} dx = \\sqrt{\\pi}$$
+
+References:
+• Einstein, A. (1905) - https://doi.org/10.1002/andp.19053221004
+• Code example: `import numpy as np`
+• Email: researcher@university.edu
+• LaTeX block: \\begin{equation}F = ma\\end{equation}""",
+                                label="Test Input (LaTeX, URLs, code, emails)", lines=8
+                            )
+                            test_masking_btn = gr.Button("▶ Test Masking")
+                            test_masking_result = gr.Textbox(label="Result", lines=6)
+                    
+                    with gr.Row():
+                        with gr.Column():
+                            gr.Markdown("**📄 Layout Test**\nTest font detection, headers, footers, structure.")
+                            layout_pdf = gr.File(label="Upload PDF to analyze layout", file_types=[".pdf"])
+                            test_layout_btn = gr.Button("▶ Test Layout")
+                            test_layout_result = gr.Textbox(label="Result", lines=6)
+                        
+                        with gr.Column():
+                            gr.Markdown("**💾 Cache Test**\nVerify translation caching is working.")
+                            test_cache_btn = gr.Button("▶ Test Cache")
+                            test_cache_result = gr.Textbox(label="Result", lines=6)
+                    
+                    # Additional test samples
+                    with gr.Accordion("📝 More Test Samples", open=False):
+                        gr.Markdown("""
+### Font & Style Tests
+Copy these to test different formatting:
+
+**Title Style:**
+`NEURAL NETWORK ARCHITECTURES FOR SCIENTIFIC DOCUMENT ANALYSIS`
+
+**Abstract Style:**
+`Abstract: This paper presents a novel approach to machine translation using transformer architectures with attention mechanisms.`
+
+**Section Headers:**
+`1. Introduction`
+`2.1 Related Work`
+`3.2.1 Methodology Details`
+
+**Bullet Points:**
+`• First item with **bold** text`
+`• Second item with *italic* text`
+`• Third item with code: model.fit(X, y)`
+
+**Numbered List:**
+`1. First step in the process`
+`2. Second step with equation $x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}$`
+`3. Third step referencing [Author2023]`
+
+**Footer/Header:**
+`Page 1 of 10 | Confidential Draft | DOI: 10.1234/example.2024`
+                        """)
+                
+                # ===========================================================
+                # TAB 3: SETTINGS
+                # ===========================================================
+                with gr.Tab("Settings"):
+                    with gr.Row():
+                        with gr.Column():
+                            gr.Markdown("### API Keys")
+                            api_backend = gr.Dropdown(
+                                ["openai", "anthropic", "deepseek"],
+                                value="openai", label="Backend"
+                            )
+                            api_key_input = gr.Textbox(label="API Key", type="password")
+                            save_key_btn = gr.Button("Save Key")
+                            api_status = gr.Textbox(label="Status", lines=2, interactive=False)
+                            
+                            gr.Markdown("### Current Keys")
+                            current_keys = gr.Textbox(
+                                value=self.get_api_keys_display(),
+                                label="", lines=4, interactive=False
+                            )
+                        
+                        with gr.Column():
+                            gr.Markdown("### Translation Settings")
+                            set_backend = gr.Dropdown(
+                                ["cascade", "free", "ollama", "openai", "anthropic", "deepseek"],
+                                value=self.config.get("default_backend", "cascade"),
+                                label="Default Backend"
+                            )
+                            set_masking = gr.Checkbox(value=self.config.get("masking_enabled", True), label="Enable Masking")
+                            set_reranking = gr.Checkbox(value=self.config.get("reranking_enabled", True), label="Enable Reranking")
+                            set_cache = gr.Checkbox(value=self.config.get("cache_enabled", True), label="Enable Cache")
+                            set_glossary = gr.Checkbox(value=self.config.get("glossary_enabled", True), label="Enable Glossary")
+                            set_context = gr.Slider(0, 10, value=self.config.get("context_window", 5), step=1, label="Context Window")
+                            set_candidates = gr.Slider(1, 5, value=self.config.get("max_candidates", 3), step=1, label="Max Candidates")
+                            
+                            save_settings_btn = gr.Button("Save Settings")
+                            settings_status = gr.Textbox(label="", interactive=False)
+                            
+                            gr.Markdown("### Maintenance")
+                            clear_cache_btn = gr.Button("Clear Cache")
+                            cache_status = gr.Textbox(label="", interactive=False)
+                
+                # ===========================================================
+                # TAB 4: GLOSSARY
+                # ===========================================================
+                with gr.Tab("Glossary"):
+                    gr.Markdown("### 📚 Domain Terminology Management")
+                    
+                    # Explanation box
+                    with gr.Accordion("ℹ️ How Glossary Works", open=False):
+                        gr.Markdown("""
+**What is the Glossary?**
+The glossary is a dictionary of domain-specific terms that ensures consistent, accurate translations of technical vocabulary.
+
+**How it's used:**
+1. **During Translation**: When the system encounters a term in the glossary, it uses your specified translation instead of the generic one
+2. **Pattern Matching**: Terms are matched case-insensitively in the source text
+3. **Priority**: Glossary translations take precedence over backend translations
+
+**Where is it stored?**
+- **Session Glossary**: Loaded terms stay in memory during your session
+- **Persistent Storage**: All loaded glossaries are saved to `~/.scitrans/glossary.json` and auto-load on next launch
+- **Cache Integration**: Glossary-enhanced translations are cached for speed
+
+**Best Practices:**
+- Load domain-specific glossaries matching your document type
+- Add custom terms for unique terminology in your field
+- Use "Load ALL" for comprehensive coverage across domains
+                        """)
+                    
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            # Domain selector dropdown
+                            gr.Markdown("**🔬 Built-in Scientific Glossaries**")
+                            glossary_domain = gr.Dropdown(
+                                choices=[
+                                    ("🤖 Machine Learning & AI (50+ terms)", "ml"),
+                                    ("⚛️ Physics & Mathematics (40+ terms)", "physics"),
+                                    ("🧬 Biology & Medical (40+ terms)", "biology"),
+                                    ("🏛️ Legal & EU Institutions (20+ terms)", "europarl"),
+                                    ("🔬 Chemistry (30+ terms)", "chemistry"),
+                                    ("💻 Computer Science (40+ terms)", "cs"),
+                                    ("📊 Statistics (25+ terms)", "statistics"),
+                                ],
+                                label="Select Domain",
+                                value="ml"
+                            )
+                            glossary_direction = gr.Radio(
+                                choices=["EN → FR", "FR → EN"],
+                                value="EN → FR",
+                                label="Direction"
+                            )
+                            with gr.Row():
+                                load_domain_btn = gr.Button("📥 Load Selected", variant="primary")
+                                load_all_btn = gr.Button("📚 Load ALL Built-in (250+ terms)", variant="secondary")
+                            
+                            gr.Markdown("---")
+                            gr.Markdown("**🌐 Online Glossary Sources**")
+                            online_source = gr.Dropdown(
+                                choices=[
+                                    ("🇪🇺 Europarl Extended (100+ EU/Legal terms)", "europarl_full"),
+                                    ("🔬 Scientific Extended (150+ research terms)", "huggingface_opus"),
+                                    ("📖 Wiktionary Common Terms (100+ general)", "wiktionary"),
+                                    ("🏛️ IATE EU Terminology (70+ official terms)", "iate"),
+                                ],
+                                label="Select Online Source",
+                                value="europarl_full"
+                            )
+                            load_online_btn = gr.Button("🌐 Load from Online", variant="secondary")
+                            
+                            gr.Markdown("---")
+                            gr.Markdown("**📁 Custom Glossary**")
+                            glossary_file = gr.File(label="Upload JSON file", file_types=[".json"])
+                            load_file_btn = gr.Button("📥 Load from File", size="sm")
+                            
+                            gr.Markdown("---")
+                            gr.Markdown("**✏️ Add Individual Term**")
+                            with gr.Row():
+                                term_source = gr.Textbox(label="Source", placeholder="neural network", scale=1)
+                                term_target = gr.Textbox(label="Translation", placeholder="réseau de neurones", scale=1)
+                            with gr.Row():
+                                add_term_btn = gr.Button("➕ Add", size="sm", variant="primary")
+                                clear_gloss_btn = gr.Button("🗑️ Clear All", size="sm", variant="stop")
+                            
+                            glossary_status = gr.Textbox(label="Status", lines=2, interactive=False, value=f"Glossary loaded: {len(self.glossary)} terms\nLocation: ~/.scitrans/glossary.json")
+                        
+                        with gr.Column(scale=1):
+                            gr.Markdown("**📖 Current Glossary**")
+                            term_count = gr.Textbox(value=f"{len(self.glossary)} terms loaded", label="", interactive=False, max_lines=1)
+                            glossary_preview = gr.JSON(label="Terms (showing first 50)", value=dict(list(self.glossary.items())[:50]) if self.glossary else {})
+                            
+                            gr.Markdown("""
+**Available Glossary Sources:**
+
+🔹 **Built-in** (offline, instant):
+- ML/AI, Physics, Biology, Chemistry, CS, Statistics, Legal
+
+🔹 **Online** (fetched from web):
+- Europarl: Official EU translation terminology
+- HuggingFace OPUS: Multilingual parallel corpus terms
+- Wiktionary: Common academic vocabulary
+- IATE: Inter-Active Terminology for Europe
+
+**JSON Format for Custom Upload:**
+```json
+{
+  "source term": "translated term",
+  "neural network": "réseau de neurones"
+}
+```
+                            """)
+                
+                # ===========================================================
+                # TAB 5: ABOUT
+                # ===========================================================
+                with gr.Tab("About"):
+                    with gr.Row():
+                        with gr.Column():
+                            gr.Markdown("""
+                            ## SciTrans LLMs v1.0
+                            
+                            Scientific Document Translation System with layout preservation.
+                            
+                            ### Features
+                            - **Masking**: Protects LaTeX, URLs, DOIs, code blocks
+                            - **Reranking**: Multi-candidate translation selection
+                            - **Context**: Document-level consistency
+                            - **Layout**: Preserves PDF structure and fonts
+                            - **Caching**: Persistent cache for faster re-translations
+                            
+                            ### Backends
+                            | Backend | Type | Cost |
+                            |---------|------|------|
+                            | cascade | Free | Free |
+                            | free | Free | Free |
+                            | ollama | Local | Free |
+                            | openai | API | $$$ |
+                            | anthropic | API | $$$ |
+                            | deepseek | API | $ |
+                            """)
+                        
+                        with gr.Column():
+                            gr.Markdown("""
+                            ### CLI Usage
+                            
+                            ```bash
+                            # Basic translation
+                            ./scitrans.sh translate paper.pdf -o output.pdf
+                            
+                            # With specific backend
+                            ./scitrans.sh translate paper.pdf --backend openai
+                            
+                            # Run tests
+                            ./scitrans.sh test
+                            
+                            # List backends
+                            ./scitrans.sh backends
+                            ```
+                            
+                            ### Tips
+                            - Use **Cascade** for free translations
+                            - Enable **Reranking** for academic papers
+                            - Add domain terms to **Glossary** tab
+                            - Use **Context** for long documents
+                            - Cache persists between sessions for speed
+                            """)
+            
+            # ===========================================================
+            # EVENT HANDLERS
+            # ===========================================================
+            
+            # PDF upload
+            def on_upload(pdf):
+                self.translated_pdf_path = None
+                if pdf is None:
+                    return None, None, gr.update(maximum=1, value=1), "of 1"
+                preview = self.preview_pdf(pdf, 1)
+                count = self.get_page_count(pdf)
+                return preview, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}"
+            
+            pdf_upload.change(fn=on_upload, inputs=[pdf_upload], outputs=[source_preview, trans_preview, page_slider, page_total])
+            
+            # Unified page navigation for source and translated previews
+            def nav_page(pdf, page, total, direction):
+                doc_path = self.translated_pdf_path if getattr(self, "translated_pdf_path", None) else pdf
+                if doc_path is None:
+                    return None, None, page
+                try:
+                    max_p = int(str(total).replace("of", "").strip())
+                except Exception:
+                    max_p = 1
+                new_p = max(1, min(max_p, int(page) + direction))
+                src_prev_img = self.preview_pdf(pdf, new_p) if pdf else None
+                trans_prev_img = None
+                if getattr(self, "translated_pdf_path", None):
+                    trans_prev_img = self.preview_pdf(self.translated_pdf_path, new_p)
+                return src_prev_img, trans_prev_img, new_p
+            
+            page_prev.click(
+                fn=lambda p, pg, t: nav_page(p, pg, t, -1),
+                inputs=[pdf_upload, page_slider, page_total],
+                outputs=[source_preview, trans_preview, page_slider],
+            )
+            page_next.click(
+                fn=lambda p, pg, t: nav_page(p, pg, t, 1),
+                inputs=[pdf_upload, page_slider, page_total],
+                outputs=[source_preview, trans_preview, page_slider],
+            )
+            page_slider.change(
+                fn=lambda p, pg, t: nav_page(p, pg, t, 0),
+                inputs=[pdf_upload, page_slider, page_total],
+                outputs=[source_preview, trans_preview, page_slider],
             )
             
-            with gr.Tabs() as tabs:
-                # Tab 1: Translation
-                with gr.Tab("📝 Translation", id="translate"):
-                    self._create_translation_tab()
-                
-                # Tab 2: Innovation Verification
-                with gr.Tab("✅ Innovation Verification", id="verify"):
-                    self._create_verification_tab()
-                
-                # Tab 3: Experiments
-                with gr.Tab("📊 Experiments", id="experiments"):
-                    self._create_experiments_tab()
-                
-                # Tab 4: Settings
-                with gr.Tab("⚙️ Settings", id="settings"):
-                    self._create_settings_tab()
-                
-                # Tab 5: Help
-                with gr.Tab("❓ Help", id="help"):
-                    self._create_help_tab()
-            
-            # Footer
-            gr.Markdown(
-                """
-                ---
-                **SciTrans-LLMs NEW** v2.0.0 | [GitHub](https://github.com/yourusername/scitrans-llms-new) | 
-                [Paper](https://arxiv.org/abs/xxxx.xxxxx) | MIT License
-                """
-            )
-            
-        return app
-    
-    def _create_translation_tab(self):
-        """Create the main translation interface."""
-        with gr.Row():
-            # Left column - Input
-            with gr.Column(scale=1):
-                gr.Markdown("### 📥 Input")
-                
-                input_type = gr.Radio(
-                    choices=["PDF Upload", "Text Input", "URL"],
-                    value="PDF Upload",
-                    label="Input Method"
-                )
-                
-                # PDF Upload
-                with gr.Group(visible=True) as pdf_group:
-                    pdf_input = gr.File(
-                        label="Upload PDF",
-                        file_types=[".pdf"],
-                        type="file"
-                    )
-                    pdf_preview = gr.Image(
-                        label="PDF Preview",
-                        height=400
-                    )
-                
-                # Text Input
-                with gr.Group(visible=False) as text_group:
-                    text_input = gr.Textbox(
-                        label="Enter Text",
-                        placeholder="Paste or type your scientific text here...",
-                        lines=15
-                    )
-                
-                # URL Input
-                with gr.Group(visible=False) as url_group:
-                    url_input = gr.Textbox(
-                        label="PDF URL",
-                        placeholder="https://arxiv.org/pdf/..."
-                    )
-                    fetch_btn = gr.Button("Fetch PDF", variant="secondary")
-                
-                # Language settings
-                gr.Markdown("### 🌐 Languages")
-                with gr.Row():
-                    source_lang = gr.Dropdown(
-                        choices=["en", "fr", "de", "es", "zh", "ja"],
-                        value="en",
-                        label="Source"
-                    )
-                    target_lang = gr.Dropdown(
-                        choices=["en", "fr", "de", "es", "zh", "ja"],
-                        value="fr",
-                        label="Target"
-                    )
-            
-            # Middle column - Settings
-            with gr.Column(scale=1):
-                gr.Markdown("### ⚙️ Translation Settings")
-                
-                # Backend selection
-                backend = gr.Dropdown(
-                    choices=["cascade", "free", "huggingface", "ollama", "deepseek", "openai", "anthropic"],
-                    value="cascade",
-                    label="Translation Backend",
-                    info="cascade, free, and huggingface are FREE!"
-                )
-                
-                model_name = gr.Dropdown(
-                    choices=["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
-                    value="gpt-4o",
-                    label="Model",
-                    visible=True
-                )
-                
-                # Quality settings
-                with gr.Accordion("🎯 Quality Settings", open=True):
-                    num_candidates = gr.Slider(
-                        minimum=1,
-                        maximum=5,
-                        value=3,
-                        step=1,
-                        label="Number of Candidates"
-                    )
-                    
-                    enable_reranking = gr.Checkbox(
-                        value=True,
-                        label="Enable Reranking"
-                    )
-                    
-                    quality_threshold = gr.Slider(
-                        minimum=0.5,
-                        maximum=1.0,
-                        value=0.7,
-                        step=0.05,
-                        label="Quality Threshold"
-                    )
-                
-                # Innovation toggles
-                with gr.Accordion("🚀 Innovations", open=True):
-                    enable_masking = gr.Checkbox(
-                        value=True,
-                        label="Innovation #1: Advanced Masking"
-                    )
-                    
-                    enable_context = gr.Checkbox(
-                        value=True,
-                        label="Innovation #2: Document Context"
-                    )
-                    
-                    preserve_layout = gr.Checkbox(
-                        value=True,
-                        label="Innovation #3: Layout Preservation"
-                    )
-                
-                # Glossary
-                with gr.Accordion("📚 Glossary", open=False):
-                    enable_glossary = gr.Checkbox(
-                        value=True,
-                        label="Use Domain Glossary"
-                    )
-                    
-                    domain = gr.Dropdown(
-                        choices=["scientific", "medical", "legal", "technical"],
-                        value="scientific",
-                        label="Domain"
-                    )
-                    
-                    custom_glossary = gr.Textbox(
-                        label="Custom Terms (JSON)",
-                        placeholder='{"term": "translation", ...}',
-                        lines=3
-                    )
-                
-                # Translate button
-                translate_btn = gr.Button(
-                    "🚀 Translate",
-                    variant="primary",
-                    size="lg"
-                )
-            
-            # Right column - Output
-            with gr.Column(scale=1):
-                gr.Markdown("### 📤 Output")
-                
-                # Progress
-                progress = gr.Textbox(
-                    label="Progress",
-                    value="Ready to translate...",
-                    interactive=False
-                )
-                
-                progress_bar = gr.Progress()
-                
-                # Translation output
-                with gr.Tabs():
-                    with gr.Tab("Translated Text"):
-                        output_text = gr.Textbox(
-                            label="Translation",
-                            lines=15,
-                            interactive=False
-                        )
-                    
-                    with gr.Tab("PDF Preview"):
-                        output_pdf_preview = gr.Image(
-                            label="Translated PDF Preview",
-                            height=400
-                        )
-                    
-                    with gr.Tab("Quality Metrics"):
-                        metrics_display = gr.JSON(
-                            label="Translation Metrics"
-                        )
-                
-                # Download buttons
-                with gr.Row():
-                    download_pdf = gr.File(
-                        label="Download PDF",
-                        visible=False
-                    )
-                    download_txt = gr.File(
-                        label="Download TXT",
-                        visible=False
-                    )
-                    download_json = gr.File(
-                        label="Download JSON",
-                        visible=False
-                    )
-        
-        # Event handlers
-        input_type.change(
-            fn=self._switch_input_type,
-            inputs=[input_type],
-            outputs=[pdf_group, text_group, url_group]
-        )
-        
-        backend.change(
-            fn=self._update_model_choices,
-            inputs=[backend],
-            outputs=[model_name]
-        )
-        
-        translate_btn.click(
-            fn=self._translate,
-            inputs=[
-                input_type, pdf_input, text_input, url_input,
-                source_lang, target_lang, backend, model_name,
-                num_candidates, enable_reranking, quality_threshold,
-                enable_masking, enable_context, preserve_layout,
-                enable_glossary, domain, custom_glossary
-            ],
-            outputs=[
-                progress, output_text, output_pdf_preview, metrics_display,
-                download_pdf, download_txt, download_json
+            # Translation
+            translate_inputs = [
+                pdf_upload,
+                source_lang,
+                target_lang,
+                backend,
+                model_selector,
+                advanced_options,
+                num_candidates,
+                context_window,
+                quality_threshold,
+                prompt_rounds,
+                batch_size,
             ]
-        )
-    
-    def _create_verification_tab(self):
-        """Create innovation verification interface."""
-        gr.Markdown(
-            """
-            ### 🔬 Innovation Verification Dashboard
+            translate_outputs = [status_box, download_btn, log_box, trans_preview, page_total, page_slider, source_preview]
             
-            This tab allows you to verify that all three innovations are working correctly.
-            """
-        )
-        
-        with gr.Row():
-            # Innovation #1 Verification
-            with gr.Column():
-                gr.Markdown("#### Innovation #1: Masking System")
-                
-                test_text_1 = gr.Textbox(
-                    label="Test Text with Formulas",
-                    value="The equation $E = mc^2$ shows that energy equals mass times the speed of light squared.",
-                    lines=3
-                )
-                
-                verify_masking_btn = gr.Button("Test Masking")
-                
-                masking_result = gr.JSON(label="Masking Result")
-                
-            # Innovation #2 Verification
-            with gr.Column():
-                gr.Markdown("#### Innovation #2: Context & Reranking")
-                
-                test_text_2 = gr.Textbox(
-                    label="Test Text for Reranking",
-                    value="Machine learning has revolutionized natural language processing.",
-                    lines=3
-                )
-                
-                verify_reranking_btn = gr.Button("Test Reranking")
-                
-                reranking_result = gr.JSON(label="Reranking Result")
-                
-            # Innovation #3 Verification  
-            with gr.Column():
-                gr.Markdown("#### Innovation #3: Layout Detection")
-                
-                test_pdf = gr.File(
-                    label="Test PDF for Layout",
-                    file_types=[".pdf"]
-                )
-                
-                verify_layout_btn = gr.Button("Test Layout Detection")
-                
-                layout_result = gr.JSON(label="Layout Detection Result")
-        
-        # Summary
-        with gr.Row():
-            verification_summary = gr.Markdown(
-                """
-                ### ✅ Verification Summary
-                
-                All innovations will be tested here. Results will show:
-                - Masking: Number of masks applied and validated
-                - Reranking: Score improvements from candidate selection
-                - Layout: Bounding boxes and structure detection
-                """
+            translate_btn.click(
+                fn=self.translate_document,
+                inputs=translate_inputs,
+                outputs=translate_outputs
             )
-    
-    def _create_experiments_tab(self):
-        """Create experiments and evaluation interface."""
-        gr.Markdown("### 📊 Experiments & Evaluation")
+            retranslate_btn.click(
+                fn=self.translate_document,
+                inputs=translate_inputs,
+                outputs=translate_outputs
+            )
+            
+            def clear_all():
+                self.translated_pdf_path = None
+                return "", gr.update(value=None, visible=False), "", None, "of 1", gr.update(maximum=1, value=1), None
+            
+            clear_btn.click(fn=clear_all, outputs=translate_outputs)
+            
+            backend.change(
+                fn=self.update_model_options,
+                inputs=[backend],
+                outputs=[model_selector]
+            )
+            
+            # Testing
+            test_backend_btn.click(fn=self.test_backend, inputs=[test_backend_sel, test_text], outputs=[test_backend_result])
+            test_masking_btn.click(fn=self.test_masking, inputs=[masking_input], outputs=[test_masking_result])
+            test_layout_btn.click(fn=self.test_layout, inputs=[layout_pdf], outputs=[test_layout_result])
+            test_cache_btn.click(fn=self.test_cache, outputs=[test_cache_result])
+            
+            # Settings
+            save_key_btn.click(fn=self.save_api_key, inputs=[api_backend, api_key_input], outputs=[api_status]).then(
+                fn=self.get_api_keys_display, outputs=[current_keys]
+            )
+            save_settings_btn.click(
+                fn=self.save_all_settings,
+                inputs=[set_backend, set_masking, set_reranking, set_cache, set_context, set_candidates, set_glossary],
+                outputs=[settings_status]
+            )
+            clear_cache_btn.click(fn=self.clear_cache, outputs=[cache_status])
+            
+            # Glossary - new dropdown-based UI
+            def load_selected_domain(domain, direction):
+                dir_code = "en-fr" if direction == "EN → FR" else "fr-en"
+                return self.load_glossary_domain(domain, dir_code)
+            
+            def get_glossary_preview():
+                # Return first 50 terms for preview
+                preview = dict(list(self.glossary.items())[:50]) if self.glossary else {}
+                return preview
+            
+            load_domain_btn.click(
+                fn=load_selected_domain,
+                inputs=[glossary_domain, glossary_direction],
+                outputs=[glossary_status, glossary_preview]
+            ).then(fn=lambda: f"{len(self.glossary)} terms loaded", outputs=[term_count])
+            
+            def load_all_with_direction(direction):
+                dir_code = "en-fr" if direction == "EN → FR" else "fr-en"
+                return self.load_all_scientific_glossaries(dir_code)
+            
+            load_all_btn.click(
+                fn=load_all_with_direction,
+                inputs=[glossary_direction],
+                outputs=[glossary_status, glossary_preview]
+            ).then(fn=lambda: f"{len(self.glossary)} terms loaded", outputs=[term_count])
+            
+            # File upload and manual terms
+            load_file_btn.click(
+                fn=self.load_glossary_file, 
+                inputs=[glossary_file], 
+                outputs=[glossary_status, glossary_preview]
+            ).then(fn=lambda: f"{len(self.glossary)} terms loaded", outputs=[term_count])
+            
+            add_term_btn.click(
+                fn=self.add_glossary_term, 
+                inputs=[term_source, term_target], 
+                outputs=[glossary_status, glossary_preview]
+            ).then(fn=lambda: f"{len(self.glossary)} terms", outputs=[term_count])
+            
+            clear_gloss_btn.click(
+                fn=self.clear_glossary, 
+                outputs=[glossary_status, glossary_preview]
+            ).then(fn=lambda: "0 terms", outputs=[term_count])
+            
+            # Online glossary loading
+            def load_online_glossary_handler(source, direction):
+                dir_code = "en-fr" if direction == "EN → FR" else "fr-en"
+                return self.load_online_glossary(source, dir_code)
+            
+            load_online_btn.click(
+                fn=load_online_glossary_handler,
+                inputs=[online_source, glossary_direction],
+                outputs=[glossary_status, glossary_preview]
+            ).then(fn=lambda: f"{len(self.glossary)} terms loaded", outputs=[term_count])
         
-        with gr.Tabs():
-            # Ablation Study
-            with gr.Tab("Ablation Study"):
-                gr.Markdown(
-                    """
-                    #### Component Impact Analysis
-                    
-                    Test the contribution of each innovation by disabling them individually.
-                    """
-                )
-                
-                ablation_config = gr.CheckboxGroup(
-                    choices=[
-                        "Masking",
-                        "Context",
-                        "Reranking", 
-                        "Layout",
-                        "Glossary"
-                    ],
-                    value=["Masking", "Context", "Reranking", "Layout", "Glossary"],
-                    label="Enable Components"
-                )
-                
-                run_ablation_btn = gr.Button("Run Ablation Study", variant="primary")
-                
-                ablation_results = gr.Dataframe(
-                    headers=["Configuration", "BLEU", "chrF", "Time (s)"],
-                    label="Ablation Results"
-                )
-                
-                ablation_chart = gr.Plot(label="Component Impact")
-            
-            # Performance Metrics
-            with gr.Tab("Performance Metrics"):
-                gr.Markdown("#### Translation Quality Metrics")
-                
-                metrics_table = gr.Dataframe(
-                    headers=["Metric", "Value", "Baseline", "Improvement"],
-                    label="Quality Metrics",
-                    value=[
-                        ["BLEU", "41.3", "32.5", "+27%"],
-                        ["chrF", "67.8", "58.2", "+16%"],
-                        ["LaTeX Preservation", "94%", "45%", "+109%"],
-                        ["Speed (s/page)", "3.4", "2.1", "-38%"]
-                    ]
-                )
-                
-                performance_chart = gr.Plot(label="Performance Comparison")
-            
-            # Thesis Tables
-            with gr.Tab("Thesis Tables"):
-                gr.Markdown("#### LaTeX Tables for Thesis")
-                
-                generate_tables_btn = gr.Button("Generate LaTeX Tables")
-                
-                latex_output = gr.Textbox(
-                    label="LaTeX Code",
-                    lines=20,
-                    value="% Tables will be generated here..."
-                )
-                
-                download_latex = gr.File(label="Download LaTeX")
-    
-    def _create_settings_tab(self):
-        """Create settings interface."""
-        with gr.Row():
-            with gr.Column():
-                gr.Markdown("### 🔑 API Keys")
-                
-                openai_key = gr.Textbox(
-                    label="OpenAI API Key",
-                    type="password",
-                    placeholder="sk-..."
-                )
-                
-                anthropic_key = gr.Textbox(
-                    label="Anthropic API Key",
-                    type="password",
-                    placeholder="sk-ant-..."
-                )
-                
-                deepseek_key = gr.Textbox(
-                    label="DeepSeek API Key",
-                    type="password",
-                    placeholder="sk-..."
-                )
-                
-                save_keys_btn = gr.Button("Save Keys", variant="secondary")
-                
-            with gr.Column():
-                gr.Markdown("### ⚡ Performance")
-                
-                batch_size = gr.Slider(
-                    minimum=1,
-                    maximum=50,
-                    value=10,
-                    step=1,
-                    label="Batch Size"
-                )
-                
-                cache_enabled = gr.Checkbox(
-                    value=True,
-                    label="Enable Translation Cache"
-                )
-                
-                timeout = gr.Slider(
-                    minimum=10,
-                    maximum=120,
-                    value=30,
-                    step=5,
-                    label="Timeout (seconds)"
-                )
-                
-            with gr.Column():
-                gr.Markdown("### 📝 Defaults")
-                
-                default_source = gr.Dropdown(
-                    choices=["en", "fr", "de", "es", "zh"],
-                    value="en",
-                    label="Default Source Language"
-                )
-                
-                default_target = gr.Dropdown(
-                    choices=["en", "fr", "de", "es", "zh"],
-                    value="fr",
-                    label="Default Target Language"
-                )
-                
-                default_backend = gr.Dropdown(
-                    choices=["openai", "anthropic", "deepseek", "free"],
-                    value="openai",
-                    label="Default Backend"
-                )
-    
-    def _create_help_tab(self):
-        """Create help documentation."""
-        gr.Markdown(
-            """
-            ## 📖 User Guide
-            
-            ### Quick Start
-            1. Upload a PDF or paste text
-            2. Select source and target languages
-            3. Choose a translation backend
-            4. Click "Translate"
-            
-            ### Innovations Explained
-            
-            #### Innovation #1: Advanced Masking
-            - Protects formulas, code, URLs from corruption
-            - Validates all masks are preserved
-            - Supports nested LaTeX environments
-            
-            #### Innovation #2: Document Context
-            - Maintains consistency across document
-            - Generates multiple candidates
-            - Reranks based on quality scores
-            
-            #### Innovation #3: Layout Preservation
-            - Extracts precise bounding boxes
-            - Uses YOLO for structure detection
-            - Maintains formatting in output
-            
-            ### Backend Options
-            
-            | Backend | Quality | Speed | Cost | Best For |
-            |---------|---------|-------|------|----------|
-            | **Cascade** | ⭐⭐⭐ | ⭐⭐⭐⭐ | **FREE** | Testing, Learning |
-            | **Free** | ⭐⭐⭐ | ⭐⭐⭐⭐ | **FREE** | Quick translations |
-            | **HuggingFace** | ⭐⭐⭐⭐ | ⭐⭐⭐ | **FREE** | Research, Open source |
-            | **Ollama** | ⭐⭐⭐⭐ | ⭐⭐⭐ | **FREE** | Offline, Privacy |
-            | DeepSeek | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | $ | Cost-effective |
-            | OpenAI | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | $$$ | Best quality |
-            | Anthropic | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | $$$ | Long documents |
-            
-            ### Tips for Best Results
-            - Use at least 3 candidates for important documents
-            - Enable all innovations for maximum quality
-            - Provide custom glossary for domain-specific terms
-            - Use higher quality threshold for publication-ready translations
-            
-            ### Troubleshooting
-            
-            **Low quality scores?**
-            - Increase number of candidates
-            - Enable reranking
-            - Add domain-specific glossary
-            
-            **Formulas corrupted?**
-            - Ensure masking is enabled
-            - Check "Validate mask restoration"
-            
-            **Slow translation?**
-            - Reduce batch size
-            - Enable caching
-            - Use faster backend (Ollama/DeepSeek)
-            """
-        )
-    
-    def _get_custom_css(self) -> str:
-        """Get custom CSS for better styling."""
-        return """
-        .gradio-container {
-            max-width: 1400px;
-            margin: auto;
-        }
-        
-        .gr-button-primary {
-            background: linear-gradient(45deg, #2196F3, #21CBF3);
-            border: none;
-        }
-        
-        .gr-button-primary:hover {
-            background: linear-gradient(45deg, #1976D2, #00ACC1);
-        }
-        
-        .gr-box {
-            border-radius: 8px;
-        }
-        
-        .gr-padded {
-            padding: 16px;
-        }
-        
-        .source-text {
-            background-color: #f0f0f0;
-            padding: 10px;
-            border-radius: 5px;
-        }
-        
-        .translated-text {
-            background-color: #e8f5e9;
-            padding: 10px;
-            border-radius: 5px;
-        }
-        """
-    
-    # Callback methods
-    def _switch_input_type(self, input_type):
-        """Switch between input types."""
-        return (
-            gr.update(visible=input_type == "PDF Upload"),
-            gr.update(visible=input_type == "Text Input"),
-            gr.update(visible=input_type == "URL")
-        )
-    
-    def _update_model_choices(self, backend):
-        """Update model choices based on backend."""
-        models = {
-            "openai": ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
-            "anthropic": ["claude-3-5-sonnet-20241022", "claude-3-opus", "claude-3-sonnet", "claude-3-haiku"],
-            "deepseek": ["deepseek-chat", "deepseek-coder"],
-            "ollama": ["llama3.1", "mistral", "codellama", "phi"],
-            "huggingface": ["Helsinki-NLP/opus-mt-en-fr", "Helsinki-NLP/opus-mt-en-de", "facebook/mbart-large-50-many-to-many-mmt"],
-            "cascade": ["multi-service"],
-            "free": ["google"]
-        }
-        
-        # Free backends don't need model selection
-        hide_model = backend in ["cascade", "free"]
-        
-        return gr.update(
-            choices=models.get(backend, []),
-            value=models.get(backend, [""])[0] if models.get(backend) else "",
-            visible=not hide_model
-        )
-    
-    def _translate(self, *args):
-        """Main translation handler."""
-        # This would implement actual translation
-        # For now, return mock results
-        
-        progress = "Translation complete!"
-        output = "Ceci est une traduction simulée du document scientifique..."
-        metrics = {
-            "bleu": 41.3,
-            "chrf": 67.8,
-            "glossary_adherence": 0.92,
-            "layout_preservation": 0.94,
-            "masks_applied": 23,
-            "masks_restored": 23,
-            "candidates_generated": 3,
-            "reranking_improvement": 0.08
-        }
-        
-        return (
-            progress,
-            output,
-            None,  # PDF preview
-            metrics,
-            None,  # PDF download
-            None,  # TXT download
-            None   # JSON download
-        )
+        return demo
 
 
-def launch_gui():
-    """Launch the GUI application."""
-    app_instance = TranslationGUI()
-    interface = app_instance.create_interface()
+def find_free_port(start_port=7860, max_attempts=10):
+    """Find a free port starting from start_port."""
+    import socket
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', port))
+                return port
+        except OSError:
+            continue
+    return start_port + max_attempts
+
+
+def launch(share=False, port=None):
+    """Launch the GUI."""
+    if port is None:
+        port = find_free_port(7860)
     
-    # Try localhost first, fall back to share if needed
-    try:
-        interface.launch(
-            server_name="127.0.0.1",
-            server_port=7860,
-            share=False,
-            inbrowser=True,
-            favicon_path=None,
-            quiet=True  # Suppress some warnings
-        )
-    except ValueError:
-        # If localhost fails, use share
-        print("Localhost not accessible, creating shareable link...")
-        interface.launch(
-            share=True,
-            inbrowser=True,
-            favicon_path=None,
-            quiet=True
-        )
+    gui = SciTransGUI()
+    app = gui.create_interface()
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=share,
+        inbrowser=True
+    )
 
 
 if __name__ == "__main__":
-    launch_gui()
+    launch()

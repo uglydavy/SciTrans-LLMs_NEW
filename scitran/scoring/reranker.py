@@ -10,11 +10,36 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 from enum import Enum
 import re
-import numpy as np
+import math
 from collections import Counter
 import logging
 
 from scitran.core.models import Block, MaskInfo
+
+# Optional numpy support - fallback to pure Python if not available
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    
+    # Create a simple namespace to provide numpy-like functions
+    class NumpyFallback:
+        @staticmethod
+        def mean(values):
+            if not values:
+                return 0.0
+            return sum(values) / len(values)
+        
+        @staticmethod
+        def std(values):
+            if len(values) < 2:
+                return 0.0
+            mean_val = sum(values) / len(values)
+            variance = sum((x - mean_val) ** 2 for x in values) / len(values)
+            return math.sqrt(variance)
+    
+    np = NumpyFallback()
 
 logger = logging.getLogger(__name__)
 

@@ -4,7 +4,7 @@ import typer
 from pathlib import Path
 from typing import Optional
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 
 from scitran.core.pipeline import TranslationPipeline, PipelineConfig
 from scitran.extraction.pdf_parser import PDFParser
@@ -52,18 +52,22 @@ def translate(
     try:
         with Progress(
             SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=30),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False
         ) as progress:
             # Parse PDF
-            task = progress.add_task("Parsing PDF...", total=None)
+            parse_task = progress.add_task("[cyan]Parsing PDF...", total=1)
             parser = PDFParser()
             document = parser.parse(str(input_file), max_pages=max_pages)
             total_blocks = sum(len(seg.blocks) for seg in document.segments)
-            progress.update(task, completed=True, description=f"✓ Parsed {total_blocks} blocks")
+            progress.update(parse_task, completed=1, description=f"[green]✓ Parsed {total_blocks} blocks")
             
             # Configure pipeline
-            task = progress.add_task("Configuring pipeline...", total=None)
+            config_task = progress.add_task("[cyan]Configuring pipeline...", total=1)
             config = PipelineConfig(
                 source_lang=source_lang,
                 target_lang=target_lang,
@@ -72,18 +76,25 @@ def translate(
                 num_candidates=candidates,
                 enable_masking=enable_masking,
                 enable_reranking=enable_reranking,
-                quality_threshold=quality_threshold
+                quality_threshold=quality_threshold,
+                cache_translations=True
             )
-            pipeline = TranslationPipeline(config)
-            progress.update(task, completed=True, description="✓ Pipeline configured")
+            
+            # Setup progress callback
+            translate_task = progress.add_task("[cyan]Translating...", total=100)
+            
+            def progress_callback(pct: float, message: str):
+                progress.update(translate_task, completed=int(pct * 100), description=f"[cyan]{message}")
+            
+            pipeline = TranslationPipeline(config, progress_callback=progress_callback)
+            progress.update(config_task, completed=1, description="[green]✓ Pipeline configured")
             
             # Translate
-            task = progress.add_task("Translating document...", total=total_blocks)
             result = pipeline.translate_document(document)
-            progress.update(task, completed=total_blocks, description="✓ Translation complete")
+            progress.update(translate_task, completed=100, description="[green]✓ Translation complete")
             
             # Render output
-            task = progress.add_task("Rendering output...", total=None)
+            render_task = progress.add_task("[cyan]Rendering output...", total=1)
             renderer = PDFRenderer()
             
             if output.suffix == ".pdf":
@@ -95,7 +106,7 @@ def translate(
             else:
                 renderer.render_simple(result.document, str(output))
             
-            progress.update(task, completed=True, description=f"✓ Output saved to {output}")
+            progress.update(render_task, completed=1, description=f"[green]✓ Output saved")
         
         # Show statistics
         console.print("\n[bold green]Translation Complete![/bold green]")
@@ -318,19 +329,17 @@ def glossary(
 
 @app.command()
 def gui():
-    """Launch the production-ready Gradio GUI."""
-    console.print("[bold blue]Launching SciTrans-LLMs GUI...[/bold blue]")
+    """Launch the Gradio GUI."""
+    console.print("[bold blue]Launching SciTrans LLMs GUI...[/bold blue]")
     console.print("Opening at http://localhost:7860")
-    console.print("\n[dim]Features: Translation, Testing, PDF Preview[/dim]")
     
     try:
-        import sys
-        from pathlib import Path
-        gui_path = Path(__file__).parent.parent.parent / "gui" / "production_app.py"
-        
-        import subprocess
-        subprocess.run([sys.executable, str(gui_path)])
-        
+        from gui.app import launch
+        launch()
+    except ImportError as e:
+        console.print(f"[red]Error: {str(e)}[/red]")
+        console.print("Install GUI dependencies: pip install gradio")
+        raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]Error launching GUI: {str(e)}[/red]")
         raise typer.Exit(1)

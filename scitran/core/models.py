@@ -136,8 +136,13 @@ class Block:
     def is_translatable(self) -> bool:
         """Check if block should be translated."""
         non_translatable = {
-            BlockType.EQUATION, BlockType.CODE, BlockType.FIGURE,
-            BlockType.HEADER, BlockType.FOOTER, BlockType.METADATA
+            BlockType.EQUATION,
+            BlockType.CODE,
+            BlockType.FIGURE,
+            BlockType.TABLE,
+            BlockType.HEADER,
+            BlockType.FOOTER,
+            BlockType.METADATA,
         }
         return self.block_type not in non_translatable
     
@@ -157,9 +162,33 @@ class Block:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> Block:
         """Create from dictionary."""
-        # Handle enum conversion
+        # Make a copy to avoid modifying original
+        data = dict(data)
+        
+        # Handle enum conversion - handle both "PARAGRAPH" and "BlockType.PARAGRAPH" formats
         if 'block_type' in data and isinstance(data['block_type'], str):
-            data['block_type'] = BlockType[data['block_type']]
+            block_type_str = data['block_type']
+            # Remove enum class prefix if present
+            if '.' in block_type_str:
+                block_type_str = block_type_str.split('.')[-1]
+            try:
+                data['block_type'] = BlockType[block_type_str]
+            except KeyError:
+                data['block_type'] = BlockType.PARAGRAPH  # Default fallback
+        
+        # Handle nested objects that might cause issues
+        # Remove keys that shouldn't be passed to constructor directly
+        keys_to_process = ['bbox', 'font', 'masks', 'metadata']
+        for key in keys_to_process:
+            if key in data and data[key] is None:
+                del data[key]
+            elif key == 'bbox' and isinstance(data.get(key), dict):
+                data[key] = BoundingBox(**data[key])
+            elif key == 'font' and isinstance(data.get(key), dict):
+                data[key] = FontInfo(**data[key])
+            elif key == 'masks' and isinstance(data.get(key), list):
+                data[key] = [MaskInfo(**m) if isinstance(m, dict) else m for m in data[key]]
+        
         return cls(**data)
 
 
@@ -341,6 +370,10 @@ class TranslationResult:
     chrf_score: Optional[float] = None
     glossary_adherence: Optional[float] = None
     layout_preservation: Optional[float] = None
+    
+    # SPRINT 1: Coverage guarantee metrics
+    coverage: float = 1.0  # Ratio of successfully translated blocks (0-1)
+    failure_report: Optional[Dict[str, Any]] = None  # Detailed failure info
     
     # Detailed stats
     blocks_translated: int = 0

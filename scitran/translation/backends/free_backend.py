@@ -45,12 +45,13 @@ class FreeBackend(TranslationBackend):
         return self.translate_sync(request)
     
     def translate_sync(self, request: TranslationRequest) -> TranslationResponse:
-        """Translate synchronously."""
+        """Translate synchronously with fallback to cascade backend."""
         start_time = time.time()
         
         source_lang = self._normalize_lang(request.source_lang)
         target_lang = self._normalize_lang(request.target_lang)
         
+        # Try Google Translate first
         try:
             translator = GoogleTranslator(source=source_lang, target=target_lang)
             
@@ -88,8 +89,44 @@ class FreeBackend(TranslationBackend):
                 metadata={"warning": "Free translation may not preserve technical terms and formatting"}
             )
             
-        except Exception as e:
-            raise RuntimeError(f"Free translation failed: {str(e)}")
+        except Exception as google_error:
+            # Fallback to cascade backend if Google fails
+            try:
+                from .cascade_backend import CascadeBackend
+                cascade = CascadeBackend()
+                cascade_response = cascade.translate_sync(request)
+                # Update backend name to indicate fallback
+                cascade_response.backend = "free(cascade_fallback)"
+                return cascade_response
+            except Exception as cascade_error:
+                # Final fallback: try MyMemory directly
+                try:
+                    import requests
+                    url = "https://api.mymemory.translated.net/get"
+                    params = {
+                        "q": request.text,
+                        "langpair": f"{source_lang}|{target_lang}"
+                    }
+                    response = requests.get(url, params=params, timeout=10)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if data.get("responseStatus") == 200:
+                        translation = data.get("responseData", {}).get("translatedText", request.text)
+                        latency = time.time() - start_time
+                        return TranslationResponse(
+                            translations=[translation],
+                            backend="free(mymemory_fallback)",
+                            model="mymemory",
+                            tokens_used=0,
+                            cost=0.0,
+                            latency=latency
+                        )
+                except:
+                    pass
+                
+                # If all fallbacks fail, raise original error
+                raise RuntimeError(f"Free translation failed: {str(google_error)}")
     
     def is_available(self) -> bool:
         """Free backend is always available."""
