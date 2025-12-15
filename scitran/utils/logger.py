@@ -3,7 +3,7 @@
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 try:
     from loguru import logger as loguru_logger
@@ -85,23 +85,30 @@ def get_logger(name: str = "scitran") -> logging.Logger:
 class LoguruWrapper:
     """Wrapper for loguru to standard logging interface."""
     
-    def __init__(self, logger):
+    def __init__(self, logger: Any) -> None:
+        """Initialize wrapper with loguru logger."""
         self._logger = logger
     
-    def debug(self, msg, *args, **kwargs):
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """Log debug message."""
         self._logger.debug(msg, *args, **kwargs)
     
-    def info(self, msg, *args, **kwargs):
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """Log info message."""
         self._logger.info(msg, *args, **kwargs)
     
-    def warning(self, msg, *args, **kwargs):
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """Log warning message."""
         self._logger.warning(msg, *args, **kwargs)
     
-    def error(self, msg, *args, **kwargs):
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """Log error message."""
         self._logger.error(msg, *args, **kwargs)
     
-    def critical(self, msg, *args, **kwargs):
+    def critical(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """Log critical message."""
         self._logger.critical(msg, *args, **kwargs)
     
-    def exception(self, msg, *args, **kwargs):
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """Log exception with traceback."""
         self._logger.exception(msg, *args, **kwargs)

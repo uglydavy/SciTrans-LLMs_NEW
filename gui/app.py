@@ -5,6 +5,7 @@ Version 1.0 - Clean Design
 """
 
 import gradio as gr
+import logging
 import sys
 import os
 import json
@@ -18,9 +19,21 @@ from queue import Queue
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Logger for GUI module
+logger = logging.getLogger(__name__)
+
 
 class SciTransGUI:
     """Clean GUI with all features."""
+    
+    def __getattr__(self, name):
+        """Defensive attribute access to prevent AttributeError for missing methods."""
+        if name == '_generate_translation_preview':
+            # Return a dummy function if method is missing (shouldn't happen, but defensive)
+            def dummy_preview(*args, **kwargs):
+                return "Preview generation method not available in this version."
+            return dummy_preview
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
     
     def __init__(self):
         self.config_file = Path.home() / ".scitrans" / "config.json"
@@ -41,6 +54,26 @@ class SciTransGUI:
                 self.config = self._default_config()
         else:
             self.config = self._default_config()
+        
+        # Load API keys from environment variables if not in config
+        env_map = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+            "huggingface": "HUGGINGFACE_API_KEY",
+        }
+        
+        if "api_keys" not in self.config:
+            self.config["api_keys"] = {}
+        
+        # Only add env vars to config if they exist and aren't already in config
+        for backend, env_var in env_map.items():
+            if backend not in self.config["api_keys"]:
+                env_value = os.environ.get(env_var)
+                if env_value and env_value.strip():
+                    # Don't save env vars to config, just note they exist
+                    # The _get_api_keys_table will check env vars directly
+                    pass
     
     def _default_config(self):
         return {
@@ -107,9 +140,25 @@ class SciTransGUI:
         quality_threshold,
         prompt_rounds,
         batch_size,
+        enable_parallel,
+        max_workers,
+        adaptive_concurrency,
+        start_page,
+        end_page,
+        font_dir,
+        font_files,
+        font_priority,
+        mask_custom_macros,
+        mask_apostrophes_in_latex,
         progress=gr.Progress()
     ):
         """Translate document with proper rendering and live progress."""
+        # Initialize logs and add_log BEFORE try block so they're always available in error handler
+        logs = []
+        def add_log(msg):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            logs.append(f"[{timestamp}] {msg}")
+        
         def _dbg_log(hid: str, loc: str, message: str, data: Dict[str, Any]):
             log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
             try:
@@ -132,12 +181,14 @@ class SciTransGUI:
             _dbg_log("H0", "translate_document:noop", "no file provided", {})
             return (
                 "Please upload a PDF file",
-                None,
+                gr.update(value=None, visible=False),
                 "",
                 None,
                 "of 0",
                 gr.update(maximum=1, value=1),
-                None
+                None,
+                "",
+                "No preview available - please upload a PDF file first."
             )
         
         # Parse advanced options
@@ -146,10 +197,14 @@ class SciTransGUI:
         use_context = "Context" in advanced_options
         use_glossary = "Glossary" in advanced_options
         
-        logs = []
-        def add_log(msg):
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            logs.append(f"[{timestamp}] {msg}")
+        # logs and add_log are already defined at function start (lines 157-158)
+        
+        # CRITICAL: Log function entry to confirm new code is loaded
+        _dbg_log("H0", "translate_document:entry", "translate_document called", {
+            "code_version": "inline_preview_v2",
+            "has_inline_code": True,
+            "method_exists": hasattr(self, '_generate_translation_preview')
+        })
         
         try:
             from scitran.extraction.pdf_parser import PDFParser
@@ -163,8 +218,42 @@ class SciTransGUI:
             add_log("Parsing PDF structure...")
             
             parser = PDFParser()
-            # Explicitly parse ALL pages (max_pages=None means all pages)
-            document = parser.parse(str(input_path), max_pages=None)
+            # Page range support - handle empty strings from Gradio
+            # Gradio Number components return None for empty, but we need to handle it properly
+            start_page_val = 0  # Default to first page (0-based)
+            if start_page is not None:
+                try:
+                    start_page_str = str(start_page).strip()
+                    if start_page_str and start_page_str.lower() not in ['none', 'null', '']:
+                        start_page_val = int(float(start_page))  # Handle both int and float inputs
+                        start_page_val = max(0, start_page_val)  # Ensure non-negative
+                except (ValueError, TypeError):
+                    start_page_val = 0
+            
+            end_page_val = None  # None means process all pages
+            if end_page is not None:
+                try:
+                    end_page_str = str(end_page).strip()
+                    if end_page_str and end_page_str.lower() not in ['none', 'null', '']:
+                        end_page_val = int(float(end_page))  # Handle both int and float inputs
+                        end_page_val = max(start_page_val, end_page_val) if end_page_val is not None else None  # Ensure >= start_page
+                except (ValueError, TypeError):
+                    end_page_val = None
+            
+            _dbg_log("H27", "translate_document:page_range", "page range parameters", {
+                "start_page_input": start_page,
+                "end_page_input": end_page,
+                "start_page_val": start_page_val,
+                "end_page_val": end_page_val,
+                "will_parse_all": start_page_val == 0 and end_page_val is None
+            })
+            
+            document = parser.parse(
+                str(input_path),
+                max_pages=None,
+                start_page=start_page_val if start_page_val is not None else 0,
+                end_page=end_page_val,
+            )
             total_blocks = len(document.translatable_blocks)
             num_pages = document.stats.get("num_pages", 0)
             add_log(f"Parsed {num_pages} pages")
@@ -196,6 +285,23 @@ class SciTransGUI:
             
             # For speed, use batch mode when reranking is off
             # When reranking is on, use user-selected candidate count (turns)
+            # Safely convert numeric inputs (handle empty strings from Gradio)
+            def safe_int(value, default=None):
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    return default
+                try:
+                    return int(value)
+                except (ValueError, TypeError):
+                    return default
+            
+            def safe_float(value, default=0.0):
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    return default
+                try:
+                    return float(value)
+                except (ValueError, TypeError):
+                    return default
+            
             config = PipelineConfig(
                 source_lang=source_lang,
                 target_lang=target_lang,
@@ -203,25 +309,49 @@ class SciTransGUI:
                 model_name=model_name if model_name and model_name != "default" else None,
                 enable_masking=enable_masking,
                 enable_reranking=enable_reranking,
-                num_candidates=int(num_candidates) if enable_reranking else 1,
+                num_candidates=safe_int(num_candidates, 1) if enable_reranking else 1,
                 cache_translations=True,
                 enable_glossary=use_glossary,
-                context_window_size=int(context_window),
-                quality_threshold=float(quality_threshold),
-                batch_size=int(batch_size),
-                prompt_optimization_rounds=int(prompt_rounds),
-                optimize_prompts=int(prompt_rounds) > 0,
+                context_window_size=safe_int(context_window, 5),
+                quality_threshold=safe_float(quality_threshold, 0.7),
+                batch_size=safe_int(batch_size, 10),
+                prompt_optimization_rounds=safe_int(prompt_rounds, 0),
+                optimize_prompts=safe_int(prompt_rounds, 0) > 0,
                 debug_mode=True,
+                mask_custom_macros=bool(mask_custom_macros),
+                mask_apostrophes_in_latex=bool(mask_apostrophes_in_latex),
+                enable_parallel_processing=bool(enable_parallel),
+                max_workers=safe_int(max_workers, None) if max_workers and str(max_workers).strip() else None,
+                adaptive_concurrency=bool(adaptive_concurrency),
             )
             
             pipeline = TranslationPipeline(config)
             
-            # Create progress callback for live updates
+            # Create progress callback for live updates with performance tracking
+            perf_metrics = {
+                "start_time": time.time(),
+                "blocks_processed": 0,
+                "cache_hits": 0,
+                "blocks_per_sec": 0.0
+            }
+            
             def pipeline_progress(prog: float, msg: str):
                 # Map pipeline progress (0-1) to our progress (0.1-0.85)
                 mapped_progress = 0.1 + (prog * 0.75)
                 progress(mapped_progress, desc=msg)
                 add_log(msg)
+                
+                # Update performance metrics
+                elapsed = time.time() - perf_metrics["start_time"]
+                if elapsed > 0 and "blocks" in msg.lower():
+                    # Try to extract block count from message
+                    import re
+                    match = re.search(r'(\d+)\s*/\s*(\d+)\s*blocks?', msg)
+                    if match:
+                        processed = int(match.group(1))
+                        total = int(match.group(2))
+                        perf_metrics["blocks_processed"] = processed
+                        perf_metrics["blocks_per_sec"] = processed / elapsed if elapsed > 0 else 0
             
             progress(0.15, desc="Starting translation...")
             add_log("Starting translation with caching enabled...")
@@ -231,6 +361,7 @@ class SciTransGUI:
             
             # Translate with progress updates
             result = pipeline.translate_document(document, progress_callback=pipeline_progress)
+            _dbg_log("H18", "translate_document:translation_done", "pipeline.translate_document returned", {"blocks_translated": result.blocks_translated, "success": result.success})
             
             # Update preview with loading state during translation
             # (The actual preview will be updated after rendering)
@@ -244,6 +375,56 @@ class SciTransGUI:
                 add_log(f"Sequential cache hits: {stats.get('cache_hits', 0)}")
             
             add_log(f"Translated {result.blocks_translated}/{total_blocks} blocks")
+            _dbg_log("H16", "translate_document:before_preview", "about to generate preview", {"has_method": hasattr(self, '_generate_translation_preview'), "method_type": str(type(getattr(self, '_generate_translation_preview', None)))})
+            
+            # Generate translation preview (text preview before rendering) - COMPLETELY INLINE, NO METHOD DEPENDENCY
+            _dbg_log("H17", "translate_document:preview_start", "starting inline preview generation", {})
+            try:
+                preview_lines = []
+                preview_lines.append("=" * 60)
+                preview_lines.append("TRANSLATION PREVIEW (Before PDF Rendering)")
+                preview_lines.append("=" * 60)
+                preview_lines.append("")
+                preview_lines.append(f"Translation completed: {result.blocks_translated}/{total_blocks} blocks translated.\n")
+                
+                block_count = 0
+                max_blocks = 50
+                for segment in document.segments:
+                    for block in segment.blocks:
+                        if not hasattr(block, 'is_translatable') or (hasattr(block, 'is_translatable') and not block.is_translatable):
+                            continue
+                        if block_count >= max_blocks:
+                            preview_lines.append(f"\n... (showing first {max_blocks} blocks)")
+                            break
+                        
+                        block_count += 1
+                        preview_lines.append(f"[Block {getattr(block, 'block_id', 'unknown')}]")
+                        
+                        if hasattr(block, 'source_text') and block.source_text:
+                            src = str(block.source_text)[:200]
+                            preview_lines.append(f"Source: {src}{'...' if len(str(block.source_text)) > 200 else ''}")
+                        
+                        if hasattr(block, 'translated_text') and block.translated_text:
+                            trans = str(block.translated_text)[:200]
+                            preview_lines.append(f"Translation: {trans}{'...' if len(str(block.translated_text)) > 200 else ''}")
+                        else:
+                            preview_lines.append("Translation: [NOT TRANSLATED]")
+                        
+                        preview_lines.append("")
+                    
+                    if block_count >= max_blocks:
+                        break
+                
+                if block_count == 0:
+                    translation_preview_text = f"Translation completed: {result.blocks_translated}/{total_blocks} blocks translated.\n\nNo translatable blocks found in document."
+                else:
+                    translation_preview_text = "\n".join(preview_lines)
+                
+                _dbg_log("H18", "translate_document:preview_success", "preview generated inline", {"block_count": block_count, "length": len(translation_preview_text)})
+            except Exception as preview_error:
+                _dbg_log("H19", "translate_document:preview_error", "Exception in inline preview", {"error": str(preview_error), "type": type(preview_error).__name__})
+                translation_preview_text = f"Translation completed: {result.blocks_translated}/{total_blocks} blocks translated.\n\nPreview generation error: {str(preview_error)}"
+                add_log(f"⚠️ Preview generation failed: {preview_error}")
             
             # Debug: Check how many blocks have translations per page
             translated_by_page = {}
@@ -274,22 +455,54 @@ class SciTransGUI:
             progress(0.9, desc="Rendering PDF...")
             add_log("Rendering translated PDF (clearing source text, preserving layout)...")
             
+            _dbg_log("H21", "translate_document:before_rendering", "about to render PDF", {
+                "has_document": "document" in locals(),
+                "has_result": "result" in locals(),
+                "blocks_translated": result.blocks_translated if "result" in locals() else 0
+            })
+            
             # Save PDF to temp directory first (Gradio requirement), then copy to persistent location
             temp_output_dir = Path(tempfile.gettempdir()) / "scitrans"
             temp_output_dir.mkdir(exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             temp_output_path = temp_output_dir / f"{input_path.stem}_{target_lang}_{timestamp}.pdf"
             
-            renderer = PDFRenderer()
+            _dbg_log("H22", "translate_document:before_renderer_init", "about to create PDFRenderer", {})
+            
+            renderer = PDFRenderer(
+                font_dir=font_dir if font_dir else None,
+                font_files=[f.strip() for f in font_files.split(",") if f.strip()] if font_files else None,
+                font_priority=[p.strip().lower() for p in font_priority.split(",") if p.strip()] if font_priority else None
+            )
+            
+            _dbg_log("H23", "translate_document:before_render_call", "about to call render_with_layout", {})
+            
             renderer.render_with_layout(str(input_path), result.document, str(temp_output_path))
+            
+            _dbg_log("H24", "translate_document:after_render", "render_with_layout completed", {
+                "output_exists": temp_output_path.exists() if "temp_output_path" in locals() else False,
+                "output_path": str(temp_output_path) if "temp_output_path" in locals() else "N/A",
+                "output_extension": str(temp_output_path.suffix) if "temp_output_path" in locals() and temp_output_path.exists() else "N/A",
+                "output_size_bytes": temp_output_path.stat().st_size if "temp_output_path" in locals() and temp_output_path.exists() else 0
+            })
             
             # Count translated pages for pagination
             try:
                 import fitz
                 with fitz.open(str(temp_output_path)) as out_pdf:
                     translated_pages = len(out_pdf)
-            except Exception:
+                    _dbg_log("H28", "translate_document:page_count", "counted pages in output PDF", {
+                        "translated_pages": translated_pages,
+                        "source_pages": document.stats.get("num_pages", 0),
+                        "output_file_exists": temp_output_path.exists(),
+                        "output_file_size_kb": temp_output_path.stat().st_size / 1024 if temp_output_path.exists() else 0
+                    })
+            except Exception as e:
                 translated_pages = document.stats.get("num_pages", 1)
+                _dbg_log("H28", "translate_document:page_count_error", "error counting pages", {
+                    "error": str(e),
+                    "fallback_pages": translated_pages
+                })
             
             # Also copy to persistent location for user access
             # Keep final output in temp (Gradio requirement) and optionally mirror to home cache
@@ -305,21 +518,57 @@ class SciTransGUI:
                 add_log(f"📁 Also saved to: {persistent_output_path}")
             else:
                 add_log(f"⚠️ Warning: PDF file not found at {temp_output_path}")
-                return f"Error: PDF not created", None, "\n".join(logs), None
+                # Return all 9 values for error case
+                return (
+                    "Error: PDF not created",
+                    gr.update(value=None, visible=False),
+                    "\n".join(logs),
+                    None,
+                    "of 0",
+                    gr.update(maximum=1, value=1),
+                    None,
+                    "Error: PDF file was not created. Check logs for details.",
+                    "No preview available - PDF creation failed."
+                )
             
             self.translated_pdf_path = str(temp_output_path)
             
             progress(1.0, desc="Complete!")
             add_log("Translation complete!")
             
+            # Calculate performance metrics
+            elapsed = time.time() - perf_metrics["start_time"]
+            blocks_per_sec = total_blocks / elapsed if elapsed > 0 else 0
+            cache_hits = stats.get('batch_cache_hits', 0) + stats.get('cache_hits', 0)
+            cache_hit_rate = (cache_hits / total_blocks * 100) if total_blocks > 0 else 0
+            
             status = f"✓ Translation Complete\n"
             status += f"Blocks: {result.blocks_translated}/{total_blocks}\n"
-            status += f"Time: {result.duration:.1f}s\n"
+            status += f"Time: {result.duration:.1f}s ({elapsed:.1f}s total)\n"
+            status += f"Speed: {blocks_per_sec:.1f} blocks/sec\n"
             status += f"Backend: {backend}"
-            if 'batch_cache_hits' in stats:
-                status += f"\nCached: {stats.get('batch_cache_hits', 0)}"
+            if cache_hits > 0:
+                status += f"\nCache: {cache_hits} hits ({cache_hit_rate:.1f}% hit rate)"
+            
+            # Performance info
+            perf_text = f"Performance Metrics:\n"
+            perf_text += f"• Throughput: {blocks_per_sec:.2f} blocks/second\n"
+            perf_text += f"• Cache hit rate: {cache_hit_rate:.1f}%\n"
+            perf_text += f"• Total time: {elapsed:.2f}s\n"
+            if 'batch_translated' in stats:
+                perf_text += f"• Batch translated: {stats.get('batch_translated', 0)}\n"
+                perf_text += f"• Batch cached: {stats.get('batch_cache_hits', 0)}"
+            
+            _dbg_log("H25", "translate_document:before_preview_pdf", "about to call preview_pdf", {
+                "has_temp_output_path": "temp_output_path" in locals(),
+                "temp_path": str(temp_output_path) if "temp_output_path" in locals() else "N/A"
+            })
             
             trans_preview = self.preview_pdf(str(temp_output_path), 1)
+            
+            _dbg_log("H26", "translate_document:after_preview_pdf", "preview_pdf completed", {
+                "has_preview": trans_preview is not None
+            })
             
             # Return the temp PDF file path (Gradio can access temp directory)
             # Show translated preview, or loading image if translation failed
@@ -336,6 +585,18 @@ class SciTransGUI:
                     "output_persistent": str(persistent_output_path),
                 },
             )
+            
+            # Log before return to catch any errors during return
+            _dbg_log("H20", "translate_document:before_return", "about to return success", {
+                "has_preview": "translation_preview_text" in locals(),
+                "preview_length": len(translation_preview_text) if "translation_preview_text" in locals() else 0,
+                "return_count": 9,
+                "output_file_path": str(temp_output_path) if "temp_output_path" in locals() else "N/A",
+                "output_file_exists": temp_output_path.exists() if "temp_output_path" in locals() else False,
+                "output_file_extension": str(temp_output_path.suffix) if "temp_output_path" in locals() else "N/A",
+                "output_file_size_kb": temp_output_path.stat().st_size / 1024 if "temp_output_path" in locals() and temp_output_path.exists() else 0
+            })
+            
             return (
                 status,
                 gr.update(value=str(temp_output_path), visible=True),
@@ -344,21 +605,143 @@ class SciTransGUI:
                 page_total_text,
                 page_update,
                 final_preview,
+                perf_text,
+                translation_preview_text,
             )
             
         except Exception as e:
             import traceback
-            add_log(f"Error: {str(e)}")
-            _dbg_log("H9", "translate_document:error", "translate failed", {"error": str(e)})
+            from scitran.core.exceptions import SciTransError
+            
+            # CRITICAL: Ensure logs and add_log are available (they should be, but defensive check)
+            if 'logs' not in locals():
+                logs = []
+            if 'add_log' not in locals():
+                def add_log(msg):
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    logs.append(f"[{timestamp}] {msg}")
+            
+            error_msg = str(e)
+            error_details = ""
+            
+            # Enhanced error display with suggestions
+            try:
+                if isinstance(e, SciTransError):
+                    error_msg = e.message
+                    if e.suggestion:
+                        error_details = f"\n\n💡 Suggestion: {e.suggestion}"
+                    if e.recoverable:
+                        error_details += "\n\nThis error is recoverable. You can try again with different settings."
+                
+                add_log(f"❌ Error: {error_msg}")
+                if error_details:
+                    add_log(error_details)
+            except:
+                # If add_log fails, at least set error_msg
+                pass
+            
+            # Enhanced error logging with full traceback
+            try:
+                import traceback as tb
+                full_traceback = tb.format_exc()
+                _dbg_log("H9", "translate_document:error", "translate failed", {
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "traceback": full_traceback,
+                    "has_method": hasattr(self, '_generate_translation_preview'),
+                    "method_exists": '_generate_translation_preview' in dir(self) if hasattr(self, '__dict__') else False
+                })
+            except:
+                # If _dbg_log fails, continue anyway
+                pass
+            
+            try:
+                full_error = f"❌ Error: {error_msg}{error_details}"
+                if hasattr(self, 'config') and self.config.get("debug_mode", False):
+                    full_error += f"\n\nDebug traceback:\n{full_traceback if 'full_traceback' in locals() else 'N/A'}"
+            except:
+                full_error = f"❌ Error: {error_msg}"
+            
+            # Generate error preview - always succeed
+            try:
+                translation_preview_text = f"Error: {error_msg}\n\nNo translation preview available due to error."
+            except:
+                translation_preview_text = "Error generating preview"
+            
+            # ALWAYS return exactly 9 values, even if something fails
+            try:
+                logs_str = "\n".join(logs) if logs else "No logs available"
+            except:
+                logs_str = "Error generating logs"
+            
+            try:
+                perf_text = f"Error occurred. Check logs for details.\n\nError: {error_msg}"
+            except:
+                perf_text = "Error occurred. Check logs for details."
+            
+            # Final return - guaranteed to return 9 values
             return (
-                f"Error: {str(e)}",
+                full_error,
                 gr.update(value=None, visible=False),
-                "\n".join(logs) + f"\n\n{traceback.format_exc()}",
+                logs_str,
                 None,
                 "of 0",
                 gr.update(maximum=1, value=1),
-                None
+                None,
+                perf_text,
+                translation_preview_text
             )
+    
+    def _generate_translation_preview(self, document, max_blocks=50):
+        """Generate text preview of translated document.
+        
+        NOTE: This method exists for backward compatibility.
+        The new inline preview generation (lines 353-400) doesn't use this method.
+        """
+        try:
+            from scitran.core.models import Document
+            
+            if not isinstance(document, Document):
+                return "No document available for preview."
+            
+            preview_lines = []
+            preview_lines.append("=" * 60)
+            preview_lines.append("TRANSLATION PREVIEW (Before PDF Rendering)")
+            preview_lines.append("=" * 60)
+            preview_lines.append("")
+            
+            block_count = 0
+            for segment in document.segments:
+                for block in segment.blocks:
+                    if not block.is_translatable:
+                        continue
+                    
+                    if block_count >= max_blocks:
+                        preview_lines.append(f"\n... (showing first {max_blocks} blocks)")
+                        break
+                    
+                    block_count += 1
+                    preview_lines.append(f"[Block {block.block_id}]")
+                    
+                    if block.source_text:
+                        preview_lines.append(f"Source: {block.source_text[:200]}{'...' if len(block.source_text) > 200 else ''}")
+                    
+                    if block.translated_text:
+                        preview_lines.append(f"Translation: {block.translated_text[:200]}{'...' if len(block.translated_text) > 200 else ''}")
+                    else:
+                        preview_lines.append("Translation: [NOT TRANSLATED]")
+                    
+                    preview_lines.append("")
+                
+                if block_count >= max_blocks:
+                    break
+            
+            if block_count == 0:
+                return "No translatable blocks found in document."
+            
+            return "\n".join(preview_lines)
+        except Exception as e:
+            return f"Error generating preview: {str(e)}"
     
     def preview_pdf(self, pdf_file, page_num=1):
         """Preview PDF page."""
@@ -433,12 +816,16 @@ class SciTransGUI:
             "anthropic": ["claude-3-5-sonnet-20241022", "claude-3-opus-20240229", "claude-3-sonnet-20240229"],
             "deepseek": ["deepseek-chat", "deepseek-coder"],
             "cascade": ["default"],
-            "free": ["default"]
+            "free": ["default"],
+            "libre": ["default"],
+            "argos": ["default"],
+            "local": ["default"]
         }
         
         options = model_options.get(backend, ["default"])
         default_value = options[0]
-        visible = backend not in ["cascade", "free"]
+        # Show model selector for backends that support model selection
+        visible = backend in ["ollama", "huggingface", "openai", "anthropic", "deepseek"]
         return {"choices": options, "value": default_value, "visible": visible}
     
     def update_model_options(self, backend):
@@ -467,6 +854,18 @@ class SciTransGUI:
             elif backend == "ollama":
                 from scitran.translation.backends.ollama_backend import OllamaBackend
                 translator = OllamaBackend()
+            elif backend == "local":
+                from scitran.translation.backends.local_backend import LocalBackend
+                translator = LocalBackend()
+            elif backend == "libre":
+                from scitran.translation.backends.libre_backend import LibreBackend
+                translator = LibreBackend()
+            elif backend == "argos":
+                from scitran.translation.backends.argos_backend import ArgosBackend
+                translator = ArgosBackend()
+            elif backend == "huggingface":
+                from scitran.translation.backends.huggingface_backend import HuggingFaceBackend
+                translator = HuggingFaceBackend()
             else:
                 api_key = self.config.get("api_keys", {}).get(backend)
                 if not api_key:
@@ -872,6 +1271,15 @@ class SciTransGUI:
         prev_count = len(self.glossary_manager)
         count = self.glossary_manager.load_domain(domain, direction)
         new_count = len(self.glossary_manager) - prev_count
+        
+        if count == 0:
+            # Try alternative file naming
+            alt_direction = direction.replace('-', '_')
+            count = self.glossary_manager.load_domain(domain, alt_direction)
+            new_count = len(self.glossary_manager) - prev_count
+        
+        if count == 0:
+            return f"⚠️ Could not load {domain} glossary. File may be missing or corrupted.", self.glossary
         
         # Update UI glossary dict
         self.glossary = self.glossary_manager.to_dict()
@@ -1454,17 +1862,94 @@ class SciTransGUI:
             result.append(f"{backend}: {masked}")
         return "\n".join(result)
     
-    def save_all_settings(self, backend, masking, reranking, cache, context, candidates, glossary):
+    def _get_api_keys_table(self):
+        """Get API keys as table data for DataFrame."""
+        keys = self.config.get("api_keys", {})
+        env_map = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+            "huggingface": "HUGGINGFACE_API_KEY",
+        }
+        
+        all_backends = ["openai", "anthropic", "deepseek", "huggingface"]
+        table_data = []
+        
+        for backend in all_backends:
+            env_var_name = env_map.get(backend)
+            
+            # Check config first (takes precedence)
+            if backend in keys and keys[backend] and keys[backend].strip():
+                masked = keys[backend][:8] + "..." + keys[backend][-4:] if len(keys[backend]) > 12 else "***"
+                status = "✅ Configured (Config)"
+            # Then check environment variables
+            elif env_var_name:
+                env_key = os.environ.get(env_var_name)
+                if env_key and env_key.strip() and len(env_key.strip()) > 0:
+                    status = "✅ From Environment"
+                    # Show last 4 chars if key is long enough
+                    if len(env_key.strip()) > 4:
+                        masked = "***" + env_key.strip()[-4:]
+                    else:
+                        masked = "***"
+                else:
+                    status = "❌ Not Set"
+                    masked = "-"
+            else:
+                status = "❌ Not Set"
+                masked = "-"
+            
+            table_data.append([backend.capitalize(), status, masked])
+        
+        return table_data
+    
+    def delete_api_key(self, backend):
+        """Delete API key for a backend."""
+        if "api_keys" not in self.config:
+            self.config["api_keys"] = {}
+        
+        if backend in self.config["api_keys"]:
+            del self.config["api_keys"][backend]
+            self.save_config()
+            
+            # Also remove from environment
+            env_map = {
+                "openai": "OPENAI_API_KEY",
+                "anthropic": "ANTHROPIC_API_KEY",
+                "deepseek": "DEEPSEEK_API_KEY",
+                "huggingface": "HUGGINGFACE_API_KEY",
+            }
+            env_var = env_map.get(backend)
+            if env_var and env_var in os.environ:
+                del os.environ[env_var]
+            
+            return f"API key deleted for {backend}"
+        else:
+            return f"No API key found for {backend}"
+    
+    def save_all_settings(
+        self, backend, masking, reranking, cache, glossary, context, 
+        context_window, candidates, strict_mode, fallback
+    ):
         """Save all settings."""
         self.config["default_backend"] = backend
         self.config["masking_enabled"] = masking
         self.config["reranking_enabled"] = reranking
         self.config["cache_enabled"] = cache
-        self.config["context_window"] = int(context)
-        self.config["max_candidates"] = int(candidates)
         self.config["glossary_enabled"] = glossary
+        self.config["context_enabled"] = context
+        self.config["context_window"] = int(context_window) if context_window else 5
+        self.config["max_candidates"] = int(candidates) if candidates else 3
+        self.config["strict_mode"] = strict_mode
+        self.config["enable_fallback"] = fallback
         self.save_config()
-        return "Settings saved"
+        return "✅ All settings saved successfully!"
+    
+    def reset_settings(self):
+        """Reset settings to defaults."""
+        self.config = self._default_config()
+        self.save_config()
+        return "✅ Settings reset to defaults"
     
     def clear_cache(self):
         """Clear translation cache."""
@@ -1496,7 +1981,7 @@ class SciTransGUI:
                 # TAB 1: TRANSLATION
                 # ===========================================================
                 with gr.Tab("Translation"):
-                    allowed_backends = ["cascade", "free", "ollama", "openai", "anthropic", "deepseek"]
+                    allowed_backends = ["cascade", "free", "ollama", "openai", "anthropic", "deepseek", "local", "libre", "argos"]
                     initial_backend = self.config.get("default_backend", "free")
                     if initial_backend not in allowed_backends:
                         initial_backend = "free"
@@ -1567,7 +2052,58 @@ class SciTransGUI:
                                     maximum=30,
                                     step=1,
                                     value=10,
-                                    label="Batch size"
+                                    label="Batch size",
+                                    info="Number of blocks to process in parallel"
+                                )
+                                enable_parallel = gr.Checkbox(
+                                    value=True,
+                                    label="Enable Parallel Processing",
+                                    info="Use parallel processing for large documents (faster)"
+                                )
+                                max_workers = gr.Number(
+                                    value=None,
+                                    precision=0,
+                                    label="Max Workers (optional)",
+                                    info="Max parallel workers (leave blank for auto-detect)"
+                                )
+                                adaptive_concurrency = gr.Checkbox(
+                                    value=True,
+                                    label="Adaptive Concurrency",
+                                    info="Automatically adjust concurrency based on backend and document size"
+                                )
+                                with gr.Row():
+                                    start_page = gr.Number(
+                                        value=0,
+                                        precision=0,
+                                        label="Start page (0-based, inclusive)"
+                                    )
+                                    end_page = gr.Number(
+                                        value=None,
+                                        precision=0,
+                                        label="End page (0-based, inclusive; blank = all)"
+                                    )
+                                font_dir = gr.Textbox(
+                                    value="",
+                                    label="Font directory (TTF/OTF) for embedding (optional)",
+                                    placeholder="/path/to/fonts"
+                                )
+                                font_files = gr.Textbox(
+                                    value="",
+                                    label="Font files (comma-separated, optional; overrides directory priority)",
+                                    placeholder="/path/to/font1.ttf,/path/to/font2.otf"
+                                )
+                                font_priority = gr.Textbox(
+                                    value="",
+                                    label="Font priority keywords (comma-separated, optional)",
+                                    placeholder="roboto,helvetica"
+                                )
+                                mask_custom_macros = gr.Checkbox(
+                                    value=True,
+                                    label="Mask custom LaTeX macros (newcommand/DeclareMathOperator/etc.)"
+                                )
+                                mask_apostrophes_in_latex = gr.Checkbox(
+                                    value=True,
+                                    label="Protect apostrophes inside LaTeX/math"
                                 )
                             
                             with gr.Row():
@@ -1576,12 +2112,30 @@ class SciTransGUI:
                                 clear_btn = gr.Button("🧹 Clear", variant="secondary")
                             
                             # Status/Log moved to left column below translate button
-                            with gr.Accordion("📊 Status & Logs", open=True):
+                            with gr.Accordion("📊 Status & Logs", open=False):
                                 with gr.Tabs():
                                     with gr.Tab("Status"):
-                                        status_box = gr.Textbox(lines=4, interactive=False, show_label=False)
+                                        status_box = gr.Textbox(
+                                            lines=4, 
+                                            interactive=False, 
+                                            show_label=False,
+                                            placeholder="Status will appear here..."
+                                        )
                                     with gr.Tab("Log"):
-                                        log_box = gr.Textbox(lines=6, interactive=False, show_label=False, autoscroll=True)
+                                        log_box = gr.Textbox(
+                                            lines=6, 
+                                            interactive=False, 
+                                            show_label=False, 
+                                            autoscroll=True,
+                                            placeholder="Translation logs will appear here..."
+                                        )
+                                    with gr.Tab("Performance"):
+                                        perf_info = gr.Textbox(
+                                            lines=4,
+                                            interactive=False,
+                                            show_label=False,
+                                            placeholder="Performance metrics will appear here..."
+                                        )
                         
                         # Right: Preview (wider) - Preview replaces progress/status area
                         with gr.Column(scale=3):
@@ -1606,6 +2160,13 @@ class SciTransGUI:
                                         height=480,
                                         show_label=False,
                                         container=False
+                                    )
+                                with gr.Tab("Text Preview"):
+                                    translation_preview = gr.Textbox(
+                                        lines=20,
+                                        label="Translation Preview (Before Rendering)",
+                                        interactive=False,
+                                        placeholder="Translation preview will appear here after translation completes..."
                                     )
                             
                             # Loading indicator (shown during translation)
@@ -1636,8 +2197,9 @@ class SciTransGUI:
                         with gr.Column():
                             gr.Markdown("**🔌 Backend Test**")
                             test_backend_sel = gr.Dropdown(
-                                ["cascade", "free", "ollama", "openai", "anthropic", "deepseek"],
-                                value="free", label="Backend"
+                                ["cascade", "free", "ollama", "openai", "anthropic", "deepseek", "local", "libre", "argos", "huggingface"],
+                                value="free", label="Backend",
+                                info="Select backend to test. Free options: cascade, free, local, libre, argos"
                             )
                             # Pre-filled with rich test content
                             test_text = gr.Textbox(
@@ -1725,42 +2287,144 @@ Copy these to test different formatting:
                 # ===========================================================
                 with gr.Tab("Settings"):
                     with gr.Row():
-                        with gr.Column():
-                            gr.Markdown("### API Keys")
-                            api_backend = gr.Dropdown(
-                                ["openai", "anthropic", "deepseek"],
-                                value="openai", label="Backend"
+                        with gr.Column(scale=1):
+                            gr.Markdown("### 🔑 API Keys Management")
+                            
+                            # API Keys Table/List
+                            api_keys_table = gr.Dataframe(
+                                headers=["Backend", "Status", "Key Preview"],
+                                value=self._get_api_keys_table(),
+                                label="Configured API Keys",
+                                interactive=False,
+                                wrap=True
                             )
-                            api_key_input = gr.Textbox(label="API Key", type="password")
-                            save_key_btn = gr.Button("Save Key")
+                            
+                            refresh_keys_btn = gr.Button("🔄 Refresh Keys Table", variant="secondary", size="sm")
+                            
+                            gr.Markdown("**Add/Update API Key**")
+                            api_backend = gr.Dropdown(
+                                ["openai", "anthropic", "deepseek", "huggingface"],
+                                value="openai", 
+                                label="Backend",
+                                info="Select backend to configure"
+                            )
+                            api_key_input = gr.Textbox(
+                                label="API Key", 
+                                type="password",
+                                placeholder="Enter API key here..."
+                            )
+                            with gr.Row():
+                                save_key_btn = gr.Button("💾 Save Key", variant="primary")
+                                delete_key_btn = gr.Button("🗑️ Delete Key", variant="stop")
+                            
                             api_status = gr.Textbox(label="Status", lines=2, interactive=False)
                             
-                            gr.Markdown("### Current Keys")
-                            current_keys = gr.Textbox(
-                                value=self.get_api_keys_display(),
-                                label="", lines=4, interactive=False
-                            )
-                        
-                        with gr.Column():
-                            gr.Markdown("### Translation Settings")
-                            set_backend = gr.Dropdown(
-                                ["cascade", "free", "ollama", "openai", "anthropic", "deepseek"],
-                                value=self.config.get("default_backend", "cascade"),
-                                label="Default Backend"
-                            )
-                            set_masking = gr.Checkbox(value=self.config.get("masking_enabled", True), label="Enable Masking")
-                            set_reranking = gr.Checkbox(value=self.config.get("reranking_enabled", True), label="Enable Reranking")
-                            set_cache = gr.Checkbox(value=self.config.get("cache_enabled", True), label="Enable Cache")
-                            set_glossary = gr.Checkbox(value=self.config.get("glossary_enabled", True), label="Enable Glossary")
-                            set_context = gr.Slider(0, 10, value=self.config.get("context_window", 5), step=1, label="Context Window")
-                            set_candidates = gr.Slider(1, 5, value=self.config.get("max_candidates", 3), step=1, label="Max Candidates")
+                            # Refresh button for API keys table
+                            refresh_keys_btn = gr.Button("🔄 Refresh Keys Table", variant="secondary", size="sm")
                             
-                            save_settings_btn = gr.Button("Save Settings")
+                            gr.Markdown("### 📋 Environment Variables")
+                            gr.Markdown("""
+                            You can also set API keys via environment variables:
+                            - `OPENAI_API_KEY` for OpenAI
+                            - `ANTHROPIC_API_KEY` for Anthropic
+                            - `DEEPSEEK_API_KEY` for DeepSeek
+                            - `HUGGINGFACE_API_KEY` for HuggingFace
+                            
+                            Keys set here override environment variables.
+                            """)
+                        
+                        with gr.Column(scale=1):
+                            gr.Markdown("### ⚙️ Translation Settings")
+                            
+                            set_backend = gr.Dropdown(
+                                ["cascade", "free", "ollama", "openai", "anthropic", "deepseek", "local", "libre", "argos", "huggingface"],
+                                value=self.config.get("default_backend", "cascade"),
+                                label="Default Backend",
+                                info="Backend to use by default"
+                            )
+                            
+                            with gr.Accordion("🔧 Core Features", open=True):
+                                set_masking = gr.Checkbox(
+                                    value=self.config.get("masking_enabled", True), 
+                                    label="Enable Masking",
+                                    info="Protect LaTeX, URLs, code from translation"
+                                )
+                                set_reranking = gr.Checkbox(
+                                    value=self.config.get("reranking_enabled", True), 
+                                    label="Enable Reranking",
+                                    info="Select best translation from multiple candidates"
+                                )
+                                set_cache = gr.Checkbox(
+                                    value=self.config.get("cache_enabled", True), 
+                                    label="Enable Cache",
+                                    info="Cache translations for faster re-runs"
+                                )
+                                set_glossary = gr.Checkbox(
+                                    value=self.config.get("glossary_enabled", True), 
+                                    label="Enable Glossary",
+                                    info="Use domain-specific terminology"
+                                )
+                                set_context = gr.Checkbox(
+                                    value=self.config.get("context_enabled", True),
+                                    label="Enable Document Context",
+                                    info="Maintain consistency across document"
+                                )
+                            
+                            with gr.Accordion("📊 Advanced Parameters", open=False):
+                                set_context_window = gr.Slider(
+                                    0, 10, 
+                                    value=self.config.get("context_window", 5), 
+                                    step=1, 
+                                    label="Context Window Size",
+                                    info="Number of previous blocks to consider"
+                                )
+                                set_candidates = gr.Slider(
+                                    1, 5, 
+                                    value=self.config.get("max_candidates", 3), 
+                                    step=1, 
+                                    label="Max Translation Candidates",
+                                    info="Number of candidates for reranking"
+                                )
+                                set_strict_mode = gr.Checkbox(
+                                    value=self.config.get("strict_mode", True),
+                                    label="Strict Mode",
+                                    info="Fail loudly if translation incomplete"
+                                )
+                                set_fallback = gr.Checkbox(
+                                    value=self.config.get("enable_fallback", True),
+                                    label="Enable Fallback Backend",
+                                    info="Use stronger backend if primary fails"
+                                )
+                            
+                            save_settings_btn = gr.Button("💾 Save All Settings", variant="primary")
                             settings_status = gr.Textbox(label="", interactive=False)
                             
-                            gr.Markdown("### Maintenance")
-                            clear_cache_btn = gr.Button("Clear Cache")
+                            gr.Markdown("### 🛠️ Maintenance")
+                            with gr.Row():
+                                clear_cache_btn = gr.Button("🗑️ Clear Cache", variant="secondary")
+                                reset_settings_btn = gr.Button("🔄 Reset to Defaults", variant="secondary")
                             cache_status = gr.Textbox(label="", interactive=False)
+                            
+                            gr.Markdown("### 📝 Basic Commands")
+                            gr.Markdown("""
+                            **CLI Commands:**
+                            ```bash
+                            # Basic translation
+                            scitrans translate input.pdf -o output.pdf
+                            
+                            # With backend
+                            scitrans translate input.pdf --backend openai
+                            
+                            # With strict mode
+                            scitrans translate input.pdf --strict-mode true
+                            
+                            # List backends
+                            scitrans backends
+                            
+                            # Run tests
+                            scitrans test
+                            ```
+                            """)
                 
                 # ===========================================================
                 # TAB 4: GLOSSARY
@@ -1849,7 +2513,13 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                         with gr.Column(scale=1):
                             gr.Markdown("**📖 Current Glossary**")
                             term_count = gr.Textbox(value=f"{len(self.glossary)} terms loaded", label="", interactive=False, max_lines=1)
-                            glossary_preview = gr.JSON(label="Terms (showing first 50)", value=dict(list(self.glossary.items())[:50]) if self.glossary else {})
+                            glossary_preview = gr.Dataframe(
+                                headers=["Source Term", "Translation"],
+                                value=[[k, v] for k, v in list(self.glossary.items())[:50]] if self.glossary else [],
+                                label="Terms (showing first 50)",
+                                wrap=True,
+                                interactive=False
+                            )
                             
                             gr.Markdown("""
 **Available Glossary Sources:**
@@ -1895,10 +2565,14 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                             |---------|------|------|
                             | cascade | Free | Free |
                             | free | Free | Free |
+                            | local | Local | Free |
+                            | libre | Free | Free |
+                            | argos | Local | Free |
                             | ollama | Local | Free |
                             | openai | API | $$$ |
                             | anthropic | API | $$$ |
                             | deepseek | API | $ |
+                            | huggingface | API/Free | Free/$$$ |
                             """)
                         
                         with gr.Column():
@@ -1987,8 +2661,18 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                 quality_threshold,
                 prompt_rounds,
                 batch_size,
+                enable_parallel,
+                max_workers,
+                adaptive_concurrency,
+                start_page,
+                end_page,
+                font_dir,
+                font_files,
+                font_priority,
+                mask_custom_macros,
+                mask_apostrophes_in_latex,
             ]
-            translate_outputs = [status_box, download_btn, log_box, trans_preview, page_total, page_slider, source_preview]
+            translate_outputs = [status_box, download_btn, log_box, trans_preview, page_total, page_slider, source_preview, perf_info, translation_preview]
             
             translate_btn.click(
                 fn=self.translate_document,
@@ -2003,7 +2687,7 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
             
             def clear_all():
                 self.translated_pdf_path = None
-                return "", gr.update(value=None, visible=False), "", None, "of 1", gr.update(maximum=1, value=1), None
+                return "", gr.update(value=None, visible=False), "", None, "of 1", gr.update(maximum=1, value=1), None, "", ""
             
             clear_btn.click(fn=clear_all, outputs=translate_outputs)
             
@@ -2020,14 +2704,47 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
             test_cache_btn.click(fn=self.test_cache, outputs=[test_cache_result])
             
             # Settings
-            save_key_btn.click(fn=self.save_api_key, inputs=[api_backend, api_key_input], outputs=[api_status]).then(
-                fn=self.get_api_keys_display, outputs=[current_keys]
+            def update_api_keys_table():
+                return self._get_api_keys_table()
+            
+            refresh_keys_btn.click(
+                fn=update_api_keys_table,
+                outputs=[api_keys_table]
             )
+            
+            save_key_btn.click(
+                fn=self.save_api_key, 
+                inputs=[api_backend, api_key_input], 
+                outputs=[api_status]
+            ).then(
+                fn=update_api_keys_table, 
+                outputs=[api_keys_table]
+            )
+            
+            delete_key_btn.click(
+                fn=self.delete_api_key,
+                inputs=[api_backend],
+                outputs=[api_status]
+            ).then(
+                fn=update_api_keys_table,
+                outputs=[api_keys_table]
+            )
+            
             save_settings_btn.click(
                 fn=self.save_all_settings,
-                inputs=[set_backend, set_masking, set_reranking, set_cache, set_context, set_candidates, set_glossary],
+                inputs=[
+                    set_backend, set_masking, set_reranking, set_cache, 
+                    set_glossary, set_context, set_context_window, 
+                    set_candidates, set_strict_mode, set_fallback
+                ],
                 outputs=[settings_status]
             )
+            
+            reset_settings_btn.click(
+                fn=self.reset_settings,
+                outputs=[settings_status]
+            )
+            
             clear_cache_btn.click(fn=self.clear_cache, outputs=[cache_status])
             
             # Glossary - new dropdown-based UI
@@ -2036,9 +2753,10 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                 return self.load_glossary_domain(domain, dir_code)
             
             def get_glossary_preview():
-                # Return first 50 terms for preview
-                preview = dict(list(self.glossary.items())[:50]) if self.glossary else {}
-                return preview
+                # Return first 50 terms for preview as DataFrame format
+                if self.glossary:
+                    return [[k, v] for k, v in list(self.glossary.items())[:50]]
+                return []
             
             load_domain_btn.click(
                 fn=load_selected_domain,

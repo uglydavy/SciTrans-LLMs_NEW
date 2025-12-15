@@ -31,8 +31,14 @@ def translate(
     candidates: int = typer.Option(1, "-c", "--candidates", help="Number of candidates"),
     enable_masking: bool = typer.Option(True, "--masking/--no-masking", help="Enable LaTeX masking"),
     enable_reranking: bool = typer.Option(False, "--reranking", help="Enable reranking"),
-    max_pages: Optional[int] = typer.Option(None, "--max-pages", help="Max pages to translate"),
-    quality_threshold: float = typer.Option(0.5, "--quality", help="Quality threshold")
+    max_pages: Optional[int] = typer.Option(None, "--max-pages", help="Max pages to translate (from start-page)"),
+    start_page: int = typer.Option(0, "--start-page", help="Start page (0-based, inclusive)"),
+    end_page: Optional[int] = typer.Option(None, "--end-page", help="End page (0-based, inclusive)"),
+    quality_threshold: float = typer.Option(0.5, "--quality", help="Quality threshold"),
+    font_dir: Optional[Path] = typer.Option(None, "--font-dir", help="Path to TTF/OTF fonts to embed"),
+    font_files: Optional[str] = typer.Option(None, "--font-files", help="Comma-separated list of TTF/OTF font files to embed"),
+    mask_custom_macros: bool = typer.Option(True, "--mask-custom-macros/--no-mask-custom-macros", help="Mask LaTeX custom macros (newcommand/DeclareMathOperator/etc.)"),
+    mask_apostrophes_in_latex: bool = typer.Option(True, "--mask-apostrophes-in-latex/--no-mask-apostrophes-in-latex", help="Protect apostrophes inside math"),
 ):
     """Translate a PDF document."""
     
@@ -62,7 +68,12 @@ def translate(
             # Parse PDF
             parse_task = progress.add_task("[cyan]Parsing PDF...", total=1)
             parser = PDFParser()
-            document = parser.parse(str(input_file), max_pages=max_pages)
+            document = parser.parse(
+                str(input_file),
+                max_pages=max_pages,
+                start_page=start_page,
+                end_page=end_page,
+            )
             total_blocks = sum(len(seg.blocks) for seg in document.segments)
             progress.update(parse_task, completed=1, description=f"[green]✓ Parsed {total_blocks} blocks")
             
@@ -77,7 +88,9 @@ def translate(
                 enable_masking=enable_masking,
                 enable_reranking=enable_reranking,
                 quality_threshold=quality_threshold,
-                cache_translations=True
+                cache_translations=True,
+                mask_custom_macros=mask_custom_macros,
+                mask_apostrophes_in_latex=mask_apostrophes_in_latex
             )
             
             # Setup progress callback
@@ -95,7 +108,10 @@ def translate(
             
             # Render output
             render_task = progress.add_task("[cyan]Rendering output...", total=1)
-            renderer = PDFRenderer()
+            renderer = PDFRenderer(
+                font_dir=str(font_dir) if font_dir else None,
+                font_files=[f.strip() for f in font_files.split(",")] if font_files else None
+            )
             
             if output.suffix == ".pdf":
                 renderer.render_with_layout(str(input_file), result.document, str(output))

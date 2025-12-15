@@ -25,15 +25,25 @@ FONT_MAP = {
     "timesnewroman": "times-roman",
     "timesnewromanps": "times-roman",
     "timesroman": "times-roman",
+    "georgia": "times-roman",
+    "garamond": "times-roman",
     # Helvetica/Arial family  
     "arial": "helv",
     "helvetica": "helv",
     "arialmt": "helv",
     "helveticaneue": "helv",
+    "verdana": "helv",
+    "tahoma": "helv",
+    "calibri": "helv",
+    "segoe": "helv",
+    "roboto": "helv",
     # Courier family
     "courier": "cour",
     "courier new": "cour",
     "couriernew": "cour",
+    "consolas": "cour",
+    "menlo": "cour",
+    "inconsolata": "cour",
     # Symbol
     "symbol": "symb",
     "zapfdingbats": "zadb",
@@ -48,7 +58,14 @@ FONT_MAP = {
 class PDFRenderer:
     """Render translated documents to PDF with proper layout preservation."""
     
-    def __init__(self, strict_mode: bool = False, embed_fonts: bool = False):
+    def __init__(
+        self,
+        strict_mode: bool = False,
+        embed_fonts: bool = True,
+        font_dir: Optional[str] = None,
+        font_files: Optional[List[str]] = None,
+        font_priority: Optional[List[str]] = None,
+    ):
         if not HAS_PYMUPDF:
             raise ImportError("PyMuPDF not installed. Run: pip install PyMuPDF")
         
@@ -57,6 +74,9 @@ class PDFRenderer:
         self.temp_files = []  # Track temp files for cleanup
         self.strict_mode = strict_mode
         self.embed_fonts = embed_fonts
+        self.font_dir = font_dir
+        self.font_files = font_files or []
+        self.font_priority = [f.lower().replace(" ", "") for f in font_priority] if font_priority else []
     
     def cleanup(self):
         """Clean up temporary files."""
@@ -74,6 +94,46 @@ class PDFRenderer:
             return self.render_with_layout(source_pdf, document, output_path)
         return self.render_simple(document, output_path)
     
+    def _register_custom_font(self, family: str, bold: bool, italic: bool) -> Optional[str]:
+        """Attempt to register a custom TTF/OTF font from explicit files first, then font_dir."""
+        import glob
+
+        def candidate_paths():
+            # explicit files take precedence
+            for f in self.font_files:
+                yield f
+            if self.font_dir:
+                for f in glob.glob(f"{self.font_dir}/**/*.ttf", recursive=True):
+                    yield f
+                for f in glob.glob(f"{self.font_dir}/**/*.otf", recursive=True):
+                    yield f
+
+        style_tokens = []
+        if bold:
+            style_tokens.append("bold")
+        if italic:
+            style_tokens.append("italic")
+        family_lower = family.lower().replace(" ", "")
+
+        for path in candidate_paths():
+            try:
+                name = Path(path).stem.lower().replace(" ", "")
+                if self.font_priority:
+                    # Enforce priority ordering if provided
+                    if not any(pref in name for pref in self.font_priority):
+                        continue
+                if family_lower and family_lower not in name:
+                    # allow loose match if priority is set
+                    if not self.font_priority:
+                        continue
+                if not all(tok in name for tok in style_tokens):
+                    continue
+                fontname = fitz.Font(fontfile=path).name
+                return fontname
+            except Exception:
+                continue
+        return None
+
     def _get_font_name(self, font_info: Optional[FontInfo]) -> Tuple[str, bool, bool]:
         """
         Map font info to available PDF font with better style preservation.
@@ -128,6 +188,11 @@ class PDFRenderer:
                 base_font = value
                 break
         
+        # Try custom font registration if a font_dir is provided
+        custom_font = self._register_custom_font(base_font, is_bold, is_italic) if self.font_dir else None
+        if custom_font:
+            return custom_font, is_bold, is_italic
+
         # Apply bold/italic variants using PyMuPDF Base14 font names
         # See: https://pymupdf.readthedocs.io/en/latest/app1.html
         if base_font in ["helv", "helvetica"]:
@@ -154,6 +219,17 @@ class PDFRenderer:
             elif is_italic:
                 return "cooo", is_bold, is_italic  # Courier-Oblique
             return "cour", is_bold, is_italic
+        elif base_font == "symb":
+            return "symb", is_bold, is_italic
+        elif base_font == "zadb":
+            return "zadb", is_bold, is_italic
+        # Fallback to a readable sans font but keep style flags
+        if is_bold and is_italic:
+            return "hebo", is_bold, is_italic
+        if is_bold:
+            return "hebo", is_bold, is_italic
+        if is_italic:
+            return "heob", is_bold, is_italic
         
         # For unknown fonts, return with style flags
         return base_font, is_bold, is_italic
@@ -197,8 +273,8 @@ class PDFRenderer:
             "drawings": [],
         }
         
-        # Extract text blocks with detailed info
-        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        # Extract text blocks with detailed info (preserve ligatures/spaces)
+        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES)
         
         for block in text_dict.get("blocks", []):
             if block.get("type") == 0:  # Text block
@@ -387,7 +463,6 @@ class PDFRenderer:
         # Get font size from original block - PRESERVE EXACT SIZE
         if block.font and block.font.size and block.font.size > 0:
             fontsize = block.font.size
-            logger.debug(f"Block {block.block_id}: Using extracted font size {fontsize}")
         else:
             # Estimate from bbox height - be more conservative
             bbox_height = rect.height
@@ -395,7 +470,6 @@ class PDFRenderer:
             # More accurate estimation: typical line height is ~1.2x font size
             estimated_size = bbox_height / num_lines / 1.2
             fontsize = max(8, min(20, estimated_size))  # Allow larger fonts
-            logger.debug(f"Block {block.block_id}: Estimated font size {fontsize} from bbox height {bbox_height}")
         
         # Get color (default black)
         color = (0, 0, 0)
@@ -404,7 +478,6 @@ class PDFRenderer:
                 hex_color = block.font.color.lstrip('#')
                 if len(hex_color) == 6:
                     color = tuple(int(hex_color[i:i+2], 16) / 255 for i in (0, 2, 4))
-                    logger.debug(f"Block {block.block_id}: Using color {color} from {hex_color}")
             except:
                 pass
         
@@ -430,7 +503,8 @@ class PDFRenderer:
                     fontname=fontname,
                     color=color,
                     align=0,  # Left align
-                    lineheight=line_height
+                    lineheight=line_height,
+                    render_mode=0,
                 )
                 
                 # rc >= 0 means text fit perfectly

@@ -38,6 +38,8 @@ class MaskingConfig:
     mask_numbers: bool = False  # Scientific notation, measurements
     mask_references: bool = True  # Citations like [1], (Smith, 2020)
     mask_acronyms: bool = False
+    mask_apostrophes_in_latex: bool = True  # Treat apostrophes inside math as part of math
+    mask_custom_macros: bool = True  # Broader macro handling
     
     # Validation settings
     strict_validation: bool = True  # Fail if masks can't be restored
@@ -72,6 +74,14 @@ class MaskingEngine:
         patterns = []
         
         if self.config.mask_latex:
+            # Protect apostrophes inside math to avoid mangling
+            if self.config.mask_apostrophes_in_latex:
+                patterns.append(MaskPattern(
+                    name="latex_apostrophe",
+                    pattern=re.compile(r'(\$[^$]*?[\'][^$]*?\$|\\\(.*?\\\))', re.DOTALL),
+                    priority=105,
+                    preserve_formatting=True
+                ))
             # LaTeX display environments (highest priority)
             patterns.append(MaskPattern(
                 name="latex_environment",
@@ -98,6 +108,48 @@ class MaskingEngine:
                 name="latex_inline",
                 pattern=re.compile(r'\$(?!\$)[^$\n]+?\$', re.DOTALL),
                 priority=90
+            ))
+            # LaTeX parenthetical inline \( ... \)
+            patterns.append(MaskPattern(
+                name="latex_inline_paren",
+                pattern=re.compile(r'\\\(.*?\\\)', re.DOTALL),
+                priority=90
+            ))
+            # LaTeX text/roman/bold/blackboard operators inside math
+            patterns.append(MaskPattern(
+                name="latex_text_ops",
+                pattern=re.compile(r'\\(?:text|mathrm|mathbf|mathbb|mathcal|mathfrak|mathsf|operatorname)\{.*?\}', re.DOTALL),
+                priority=92  # above inline math to preserve operators
+            ))
+            if self.config.mask_custom_macros:
+                # Custom macro definitions (multi-line)
+                patterns.append(MaskPattern(
+                    name="latex_newcommand",
+                    pattern=re.compile(r'\\newcommand\{\\[A-Za-z]+\}\s*\{.*?\}', re.DOTALL),
+                    priority=87
+                ))
+                patterns.append(MaskPattern(
+                    name="latex_newcommand_opt",
+                    pattern=re.compile(r'\\newcommand\{\\[A-Za-z]+\}\s*\[[^\]]+\]\s*\{.*?\}', re.DOTALL),
+                    priority=87
+                ))
+                # DeclareMathOperator
+                patterns.append(MaskPattern(
+                    name="latex_declare_operator",
+                    pattern=re.compile(r'\\DeclareMathOperator\*?\{\\[A-Za-z]+\}\{.*?\}', re.DOTALL),
+                    priority=87
+                ))
+                # Providecommand
+                patterns.append(MaskPattern(
+                    name="latex_provide_command",
+                    pattern=re.compile(r'\\providecommand\{\\[A-Za-z]+\}\s*\{.*?\}', re.DOTALL),
+                    priority=86
+                ))
+            # Common escaped braces/percents inside math
+            patterns.append(MaskPattern(
+                name="latex_escaped_brace",
+                pattern=re.compile(r'\\[{}%]'),
+                priority=86
             ))
             
             # LaTeX commands (without arguments)
@@ -215,7 +267,7 @@ class MaskingEngine:
             return block
         
         # First, find all matches across all patterns on the original text
-        all_matches: List[Tuple[int, int, str, str, bool]] = []  # (start, end, original, pattern_name, preserve_fmt)
+        all_matches: List[Tuple[int, int, int, str, str, bool]] = []  # (start, end, priority, original, pattern_name, preserve_fmt)
         
         for pattern_def in self.patterns:
             matches = list(pattern_def.pattern.finditer(block.source_text))
@@ -224,24 +276,30 @@ class MaskingEngine:
                 all_matches.append((
                     start, 
                     end, 
+                    pattern_def.priority,
                     match.group(0),
                     pattern_def.name,
                     pattern_def.preserve_formatting
                 ))
         
-        # Sort by start position
-        all_matches.sort(key=lambda x: x[0])
+        # Sort by start position, then priority (higher first)
+        all_matches.sort(key=lambda x: (x[0], -x[2]))
         
         # Remove overlapping matches (keep higher priority ones - they were added first due to pattern order)
         non_overlapping = []
         for match in all_matches:
-            start, end = match[0], match[1]
-            # Check if this overlaps with any already accepted match
+            start, end, priority = match[0], match[1], match[2]
             overlaps = False
-            for accepted in non_overlapping:
-                a_start, a_end = accepted[0], accepted[1]
+            for idx, accepted in enumerate(non_overlapping):
+                a_start, a_end, a_pri = accepted[0], accepted[1], accepted[2]
                 if start < a_end and end > a_start:
+                    # Allow nested masks (one fully contained in the other)
+                    if (start >= a_start and end <= a_end) or (a_start >= start and a_end <= end):
+                        overlaps = False
+                        break
                     overlaps = True
+                    if priority > a_pri:
+                        non_overlapping[idx] = match  # replace with higher priority
                     break
             if not overlaps:
                 non_overlapping.append(match)
@@ -253,7 +311,7 @@ class MaskingEngine:
         masked_text = block.source_text
         masks = []
         
-        for start, end, original, pattern_name, preserve_fmt in non_overlapping:
+        for start, end, priority, original, pattern_name, preserve_fmt in non_overlapping:
             # Generate placeholder
             placeholder = self._generate_placeholder(pattern_name)
             
@@ -389,3 +447,17 @@ class MaskingEngine:
         self.mask_registry.clear()
         self.mask_counter.clear()
         self.validation_errors.clear()
+
+    # Convenience for unit tests / standalone usage
+    def apply_text(self, text: str) -> str:
+        """Apply masking to raw text (non-block)."""
+        from scitran.core.models import Block, BlockType, BoundingBox
+        tmp_block = Block(
+            block_id="tmp",
+            source_text=text,
+            block_type=BlockType.PARAGRAPH,
+            bbox=BoundingBox(0, 0, 1, 1, page=0),
+            masks=[],
+        )
+        masked_block = self.mask_block(tmp_block)
+        return masked_block.masked_text or masked_block.source_text

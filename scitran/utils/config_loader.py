@@ -43,7 +43,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     return config
 
 
-def save_config(config: Dict[str, Any], config_path: str):
+def save_config(config: Dict[str, Any], config_path: str) -> None:
     """
     Save configuration to YAML file.
     

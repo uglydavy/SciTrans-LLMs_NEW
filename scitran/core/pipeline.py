@@ -13,6 +13,7 @@ import time
 import logging
 from datetime import datetime
 import json
+import re
 import os
 import unicodedata
 
@@ -44,6 +45,8 @@ class PipelineConfig:
     enable_masking: bool = True
     masking_config: MaskingConfig = field(default_factory=MaskingConfig)
     validate_mask_restoration: bool = True
+    mask_custom_macros: bool = True
+    mask_apostrophes_in_latex: bool = True
     
     # Innovation #2: Document context
     enable_context: bool = True
@@ -93,6 +96,9 @@ class PipelineConfig:
     cache_dir: Optional[Path] = None
     max_retries: int = 3
     timeout: int = 30  # Seconds per block
+    enable_parallel_processing: bool = True  # Enable parallel processing for large documents
+    max_workers: Optional[int] = None  # Max parallel workers (None = auto-detect)
+    adaptive_concurrency: bool = True  # Adjust concurrency based on backend
     
     # Output settings
     output_format: str = "pdf"  # pdf, docx, txt, json
@@ -142,6 +148,16 @@ class TranslationPipeline:
     def __init__(self, config: Optional[PipelineConfig] = None, progress_callback: Optional[Callable[[float, str], None]] = None):
         self.config = config or PipelineConfig()
         self.progress_callback = progress_callback
+        
+        # Sync masking flags into masking_config
+        if self.config.masking_config:
+            self.config.masking_config.mask_custom_macros = self.config.mask_custom_macros
+            self.config.masking_config.mask_apostrophes_in_latex = self.config.mask_apostrophes_in_latex
+        else:
+            self.config.masking_config = MaskingConfig(
+                mask_custom_macros=self.config.mask_custom_macros,
+                mask_apostrophes_in_latex=self.config.mask_apostrophes_in_latex,
+            )
         
         # Validate configuration
         issues = self.config.validate()
@@ -421,8 +437,11 @@ class TranslationPipeline:
             
             if self.config.strict_mode:
                 logger.error(f"✗ Translation coverage: {coverage:.1%} - STRICT mode: failing")
+                # Get list of missing block IDs
+                missing_block_ids = [block.block_id for block in missing_blocks]
                 raise TranslationCoverageError(
-                    f"Translation incomplete: {final_missing}/{total_translatable} blocks failed",
+                    coverage=coverage,
+                    missing_blocks=missing_block_ids,
                     failure_report=failure_report
                 )
             else:
@@ -843,20 +862,56 @@ Provide only the refined translation, with no explanations."""
         return self.config.backend.lower() in mask_unsafe_backends
     
     def _translate_blocks_batch(self, document: Document):
-        """Translate blocks using fast async batch processing."""
+        """Translate blocks using optimized fast async batch processing."""
         from scitran.utils.fast_translator import FastTranslator
+        import os
         
-        # Create fast translator with async + caching
-        # Optimize for speed: increase concurrency and reduce delays
-        # Free services can handle more concurrent requests with proper caching
-        max_concurrent = 5 if self.config.backend.lower() in {'cascade', 'free'} else 8
+        # Adaptive concurrency based on document size and backend
+        total_blocks = len(document.translatable_blocks)
+        backend = self.config.backend.lower()
+        
+        # Calculate optimal concurrency
+        if self.config.adaptive_concurrency:
+            # Base concurrency on backend capabilities
+            if backend in {'cascade', 'free'}:
+                # Free backends: moderate concurrency to avoid rate limits
+                base_concurrent = 5
+            elif backend in {'openai', 'anthropic', 'deepseek'}:
+                # Paid APIs: higher concurrency (they handle it well)
+                base_concurrent = 10
+            elif backend in {'ollama', 'huggingface'}:
+                # Local/self-hosted: depends on resources
+                base_concurrent = 4
+            else:
+                base_concurrent = 6
+            
+            # Scale with document size (but cap at reasonable limit)
+            if total_blocks > 100:
+                max_concurrent = min(base_concurrent * 2, 20)  # Cap at 20
+            elif total_blocks > 50:
+                max_concurrent = min(base_concurrent * 1.5, 15)  # Cap at 15
+            else:
+                max_concurrent = base_concurrent
+            
+            # Override with config if set
+            if self.config.max_workers:
+                max_concurrent = min(max_concurrent, self.config.max_workers)
+        else:
+            # Use fixed concurrency
+            max_concurrent = 5 if backend in {'cascade', 'free'} else 8
+            if self.config.max_workers:
+                max_concurrent = self.config.max_workers
+        
+        # Optimize rate limit delay based on caching effectiveness
+        # If we have good cache hit rate, we can reduce delays
+        rate_limit_delay = 0.2 if backend in {'cascade', 'free'} else 0.1
         
         fast_translator = FastTranslator(
-            max_concurrent=max_concurrent,
+            max_concurrent=int(max_concurrent),
             cache_dir=str(self.config.cache_dir) if self.config.cache_dir else ".cache/translations",
-            timeout=30,  # Increased timeout for reliability
-            retry_count=3,  # More retries
-            rate_limit_delay=0.2  # Reduced delay - caching handles most requests
+            timeout=self.config.timeout,
+            retry_count=self.config.max_retries,
+            rate_limit_delay=rate_limit_delay
         )
         
         blocks = document.translatable_blocks
@@ -941,9 +996,24 @@ Provide only the refined translation, with no explanations."""
         """Translate blocks sequentially with caching support."""
         total_blocks = len(document.translatable_blocks)
         
+        # Get page info for enhanced progress
+        pages = set()
+        for block in document.translatable_blocks:
+            if block.bbox and block.bbox.page is not None:
+                pages.add(block.bbox.page)
+        total_pages = len(pages) if pages else 1
+        
         for i, block in enumerate(document.translatable_blocks):
             progress = 0.2 + (0.6 * (i + 1) / max(total_blocks, 1))
-            self._report_progress(progress, f"Block {i+1}/{total_blocks}")
+            page_num = block.bbox.page if block.bbox and block.bbox.page is not None else None
+            self._report_progress(
+                progress, 
+                f"Translating block {i+1}/{total_blocks}",
+                block_index=i,
+                total_blocks=total_blocks,
+                page_index=page_num,
+                total_pages=total_pages
+            )
             
             try:
                 text_to_translate = block.masked_text or block.source_text
@@ -1225,8 +1295,34 @@ Provide only the refined translation, with no explanations."""
             end_idx = cleaned.find("</think>")
             if end_idx != -1:
                 cleaned = cleaned[end_idx + len("</think>") :].strip()
-        cleaned = self._strip_control_chars(cleaned)
+        # Normalize spacing and quotes FIRST (before stripping control chars)
+        cleaned = cleaned.replace("\u00A0", " ")  # nbsp
+        cleaned = cleaned.replace("'", "'").replace("'", "'").replace("`", "'").replace("´", "'")
+        cleaned = cleaned.replace("\ufffd", "'")  # unknown replacement char to apostrophe
+        
+        # Preserve newlines but collapse multiple spaces/tabs within lines
+        # First, normalize line breaks (CRLF -> LF, CR -> LF)
+        cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+        
+        # Strip control chars EXCEPT newlines (category 'C' but not '\n')
+        # We need to preserve newlines for layout
+        cleaned = "".join(ch for ch in cleaned if unicodedata.category(ch)[0] != "C" or ch == "\n")
+        
         cleaned = self._apply_glossary(cleaned)
+        # Collapse multiple spaces/tabs (but not newlines) within each line
+        lines = cleaned.split("\n")
+        normalized_lines = []
+        for line in lines:
+            # Collapse spaces/tabs within the line, but preserve single spaces
+            normalized_line = re.sub(r"[ \t]+", " ", line)
+            # Remove trailing spaces
+            normalized_line = normalized_line.rstrip()
+            normalized_lines.append(normalized_line)
+        cleaned = "\n".join(normalized_lines)
+        # Collapse excessive consecutive newlines (max 2)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        # Remove space before punctuation (but preserve newlines)
+        cleaned = re.sub(r" +([.,;:!?])", r"\1", cleaned)
         return cleaned
     
     def _validate_translation(self, document: Document) -> Dict[str, float]:
@@ -1338,6 +1434,15 @@ Provide only the refined translation, with no explanations."""
             elif backend_name == "deepseek":
                 from scitran.translation.backends.deepseek_backend import DeepSeekBackend
                 return DeepSeekBackend(api_key=self.config.api_key, model=self.config.model_name)
+            elif backend_name == "local":
+                from scitran.translation.backends.local_backend import LocalBackend
+                return LocalBackend()
+            elif backend_name == "libre":
+                from scitran.translation.backends.libre_backend import LibreTranslateBackend
+                return LibreTranslateBackend(api_key=self.config.api_key, model=self.config.model_name)
+            elif backend_name == "argos":
+                from scitran.translation.backends.argos_backend import ArgosBackend
+                return ArgosBackend()
             else:
                 logger.warning(f"Unknown backend: {backend_name}, using cascade")
                 from scitran.translation.backends.cascade_backend import CascadeBackend
@@ -1369,11 +1474,58 @@ Provide only the refined translation, with no explanations."""
             glossary=self.glossary if self.config.enable_glossary else None
         )
     
-    def _report_progress(self, progress: float, message: str):
-        """Report progress to callback if provided."""
+    def _report_progress(
+        self, 
+        progress: float, 
+        message: str,
+        block_index: Optional[int] = None,
+        total_blocks: Optional[int] = None,
+        page_index: Optional[int] = None,
+        total_pages: Optional[int] = None
+    ):
+        """
+        Report progress to callback if provided.
+        
+        Enhanced with per-block and per-page granularity.
+        
+        Args:
+            progress: Overall progress (0.0-1.0)
+            message: Progress message
+            block_index: Current block index (for per-block progress)
+            total_blocks: Total number of blocks (for per-block progress)
+            page_index: Current page index (for per-page progress)
+            total_pages: Total number of pages (for per-page progress)
+        """
+        # Build enhanced message with granular info
+        enhanced_message = message
+        if block_index is not None and total_blocks is not None:
+            enhanced_message += f" (Block {block_index + 1}/{total_blocks})"
+        if page_index is not None and total_pages is not None:
+            enhanced_message += f" (Page {page_index + 1}/{total_pages})"
+        
         if self.progress_callback:
-            self.progress_callback(progress, message)
-        logger.info(f"[{progress:.0%}] {message}")
+            # Pass additional context if callback supports it
+            if hasattr(self.progress_callback, '__code__'):
+                # Check if callback accepts more arguments
+                import inspect
+                sig = inspect.signature(self.progress_callback)
+                if len(sig.parameters) > 2:
+                    # Enhanced callback with granular info
+                    self.progress_callback(
+                        progress, 
+                        enhanced_message,
+                        block_index=block_index,
+                        total_blocks=total_blocks,
+                        page_index=page_index,
+                        total_pages=total_pages
+                    )
+                else:
+                    # Standard callback
+                    self.progress_callback(progress, enhanced_message)
+            else:
+                self.progress_callback(progress, enhanced_message)
+        
+        logger.info(f"[{progress:.0%}] {enhanced_message}")
         
     def get_statistics(self) -> Dict[str, Any]:
         """Get pipeline execution statistics."""

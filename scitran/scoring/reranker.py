@@ -296,6 +296,7 @@ class MultiDimensionalScorer:
         Score glossary term adherence.
         
         Checks if glossary terms are correctly translated.
+        Higher score for candidates that use ALL glossary terms correctly.
         """
         dimension = QualityDimension(name="terminology", weight=weight)
         
@@ -303,28 +304,37 @@ class MultiDimensionalScorer:
             dimension.score = 1.0  # No glossary to check
             return dimension
             
-        found_terms = 0
+        total_terms = len(glossary)
         correct_terms = 0
+        incorrect_terms = 0
         
         text_lower = text.lower()
         
         for source_term, target_term in glossary.items():
-            # Check if the target term appears in translation
-            if target_term.lower() in text_lower:
-                found_terms += 1
+            source_lower = source_term.lower()
+            target_lower = target_term.lower()
+            
+            # Check if the target term appears in translation (correct)
+            if target_lower in text_lower:
                 correct_terms += 1
-            # Check if source term wrongly appears (untranslated)
-            elif source_term.lower() in text_lower:
-                found_terms += 1
-                # This is incorrect - term not translated
-                
-        if found_terms > 0:
-            dimension.score = correct_terms / found_terms
+            # Check if source term wrongly appears (untranslated - incorrect)
+            elif source_lower in text_lower:
+                incorrect_terms += 1
+            # If neither appears, it's a missing term (also incorrect)
+            # (This is implicit - we count it as incorrect)
+        
+        # Score based on: (correct - incorrect) / total
+        # This rewards candidates with more correct terms and penalizes incorrect ones
+        if total_terms > 0:
+            # Normalize to 0-1 range
+            raw_score = (correct_terms - incorrect_terms) / total_terms
+            dimension.score = max(0.0, min(1.0, raw_score))
         else:
             dimension.score = 1.0  # No terms to check
             
-        dimension.details['terms_found'] = found_terms
+        dimension.details['terms_total'] = total_terms
         dimension.details['terms_correct'] = correct_terms
+        dimension.details['terms_incorrect'] = incorrect_terms
         
         return dimension
     

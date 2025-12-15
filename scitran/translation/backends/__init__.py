@@ -7,6 +7,9 @@ from .ollama_backend import OllamaBackend
 from .free_backend import FreeBackend
 from .cascade_backend import CascadeBackend
 from .huggingface_backend import HuggingFaceBackend
+from .local_backend import LocalBackend
+from .libre_backend import LibreTranslateBackend
+from .argos_backend import ArgosBackend
 
 __all__ = [
     'OpenAIBackend',
@@ -15,5 +18,8 @@ __all__ = [
     'OllamaBackend',
     'FreeBackend',
     'CascadeBackend',
-    'HuggingFaceBackend'
+    'HuggingFaceBackend',
+    'LocalBackend',
+    'LibreTranslateBackend',
+    'ArgosBackend'
 ]

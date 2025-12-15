@@ -107,7 +107,7 @@ class FreeBackend(TranslationBackend):
                         "q": request.text,
                         "langpair": f"{source_lang}|{target_lang}"
                     }
-                    response = requests.get(url, params=params, timeout=10)
+                    response = requests.get(url, params=params, timeout=5)
                     response.raise_for_status()
                     data = response.json()
                     

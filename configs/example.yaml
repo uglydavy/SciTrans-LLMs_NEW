@@ -1,0 +1,34 @@
+# Example pipeline configuration (authoritative fields shared by CLI/GUI)
+source_lang: en
+target_lang: fr
+backend: cascade
+strict_mode: true
+max_translation_retries: 2
+retry_backoff_factor: 2.0
+enable_fallback_backend: true
+fallback_backend: openai
+detect_identity_translation: true
+
+# Glossary
+enable_glossary: true
+glossary_domains: ["ml", "physics"]
+# Optional custom glossary file (JSON term->translation)
+glossary_path: ""
+
+# Context & refinement
+enable_context: true
+enable_refinement: true
+
+# Ablations / toggles
+enable_masking: true
+enable_reranking: false
+enable_adaptive_escalation: true
+
+# Output
+output_dir: "./output"
+failure_report_dir: "./output/failures"
+
+# Logging
+log_level: "INFO"
+run_id: "local-dev"
+

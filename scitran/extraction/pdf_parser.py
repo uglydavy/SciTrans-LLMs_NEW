@@ -28,13 +28,21 @@ class PDFParser:
         
         self.use_ocr = use_ocr
     
-    def parse(self, pdf_path: str, max_pages: Optional[int] = None) -> Document:
+    def parse(
+        self,
+        pdf_path: str,
+        max_pages: Optional[int] = None,
+        start_page: int = 0,
+        end_page: Optional[int] = None,
+    ) -> Document:
         """
         Parse PDF and extract structured content.
         
         Args:
             pdf_path: Path to PDF file
             max_pages: Maximum number of pages to process (None = all)
+            start_page: 0-based start page to process (inclusive)
+            end_page: 0-based end page to process (inclusive). None = until max_pages or end.
             
         Returns:
             Document object with structured content
@@ -45,12 +53,18 @@ class PDFParser:
         
         doc = fitz.open(str(pdf_path))
         
+        total_pages = len(doc)
+        start = max(0, start_page)
+        stop = end_page + 1 if end_page is not None else total_pages
+        if max_pages:
+            stop = min(stop, start + max_pages)
+        stop = min(stop, total_pages)
+
         blocks = []
         block_counter = 0
+        num_pages = max(0, stop - start)
         
-        num_pages = min(len(doc), max_pages) if max_pages else len(doc)
-        
-        for page_num in range(num_pages):
+        for page_num in range(start, stop):
             page = doc[page_num]
             page_blocks = self._extract_page_blocks(page, page_num, block_counter)
             blocks.extend(page_blocks)
@@ -85,8 +99,8 @@ class PDFParser:
         
         blocks = []
         
-        # Get text with layout information
-        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        # Get text with layout information and preserve ligatures/spaces
+        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES)
         
         for block_idx, block_data in enumerate(text_dict.get("blocks", [])):
             if "lines" not in block_data:
@@ -116,6 +130,9 @@ class PDFParser:
             for line in block_data["lines"]:
                 line_text = ""
                 for span in line["spans"]:
+                    # Preserve spacing between spans if needed
+                    if line_text and not line_text.endswith(" ") and span["text"] and not span["text"].startswith(" "):
+                        line_text += " "
                     line_text += span["text"]
                     # Collect font information
                     fonts.append({
