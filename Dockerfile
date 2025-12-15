@@ -23,6 +23,7 @@ COPY cli/ ./cli/
 COPY gui/ ./gui/
 COPY configs/ ./configs/
 COPY scripts/ ./scripts/
+COPY scitrans ./scitrans
 COPY README.md .
 
 # Runtime env
@@ -40,5 +41,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "from scitran.core.pipeline import TranslationPipeline; print('OK')" || exit 1
 
 # Default: launch GUI
-CMD ["./scitrans", "gui"]
+# Note: scitrans script is copied but in Docker we use Python directly
+# The script is available for manual use via docker exec
+RUN chmod +x ./scitrans
+# Use Python directly in Docker (no venv needed)
+CMD ["python", "-m", "cli.commands.main", "gui"]
 

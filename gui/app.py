@@ -158,27 +158,7 @@ class SciTransGUI:
         def add_log(msg):
             timestamp = datetime.now().strftime("%H:%M:%S")
             logs.append(f"[{timestamp}] {msg}")
-        
-        def _dbg_log(hid: str, loc: str, message: str, data: Dict[str, Any]):
-            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
-            try:
-                os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                payload = {
-                    "sessionId": "debug-session",
-                    "runId": "post-fix",
-                    "hypothesisId": hid,
-                    "location": loc,
-                    "message": message,
-                    "data": data,
-                    "timestamp": int(time.time() * 1000),
-                }
-                with open(log_path, "a") as f:
-                    f.write(json.dumps(payload) + "\n")
-            except Exception:
-                pass
-        
         if pdf_file is None:
-            _dbg_log("H0", "translate_document:noop", "no file provided", {})
             return (
                 "Please upload a PDF file",
                 gr.update(value=None, visible=False),
@@ -198,13 +178,6 @@ class SciTransGUI:
         use_glossary = "Glossary" in advanced_options
         
         # logs and add_log are already defined at function start (lines 157-158)
-        
-        # CRITICAL: Log function entry to confirm new code is loaded
-        _dbg_log("H0", "translate_document:entry", "translate_document called", {
-            "code_version": "inline_preview_v2",
-            "has_inline_code": True,
-            "method_exists": hasattr(self, '_generate_translation_preview')
-        })
         
         try:
             from scitran.extraction.pdf_parser import PDFParser
@@ -236,18 +209,14 @@ class SciTransGUI:
                     end_page_str = str(end_page).strip()
                     if end_page_str and end_page_str.lower() not in ['none', 'null', '']:
                         end_page_val = int(float(end_page))  # Handle both int and float inputs
-                        end_page_val = max(start_page_val, end_page_val) if end_page_val is not None else None  # Ensure >= start_page
+                        # If end_page is 0, treat as "all pages" (None) - 0 means "no limit" in UI
+                        if end_page_val == 0:
+                            end_page_val = None
+                        else:
+                            end_page_val = max(start_page_val, end_page_val) if end_page_val is not None else None  # Ensure >= start_page
                 except (ValueError, TypeError):
                     end_page_val = None
-            
-            _dbg_log("H27", "translate_document:page_range", "page range parameters", {
-                "start_page_input": start_page,
-                "end_page_input": end_page,
-                "start_page_val": start_page_val,
-                "end_page_val": end_page_val,
-                "will_parse_all": start_page_val == 0 and end_page_val is None
-            })
-            
+
             document = parser.parse(
                 str(input_path),
                 max_pages=None,
@@ -258,7 +227,6 @@ class SciTransGUI:
             num_pages = document.stats.get("num_pages", 0)
             add_log(f"Parsed {num_pages} pages")
             add_log(f"Found {total_blocks} text blocks")
-            _dbg_log("H1", "translate_document:parsed", "document parsed", {"pages": num_pages, "blocks": total_blocks})
             
             # Log blocks per page for debugging
             blocks_per_page = {}
@@ -356,13 +324,9 @@ class SciTransGUI:
             progress(0.15, desc="Starting translation...")
             add_log("Starting translation with caching enabled...")
             
-            # Show loading state in preview
-            loading_img = self.create_loading_image("Translating... Please wait")
-            
             # Translate with progress updates
             result = pipeline.translate_document(document, progress_callback=pipeline_progress)
-            _dbg_log("H18", "translate_document:translation_done", "pipeline.translate_document returned", {"blocks_translated": result.blocks_translated, "success": result.success})
-            
+
             # Update preview with loading state during translation
             # (The actual preview will be updated after rendering)
             
@@ -375,10 +339,9 @@ class SciTransGUI:
                 add_log(f"Sequential cache hits: {stats.get('cache_hits', 0)}")
             
             add_log(f"Translated {result.blocks_translated}/{total_blocks} blocks")
-            _dbg_log("H16", "translate_document:before_preview", "about to generate preview", {"has_method": hasattr(self, '_generate_translation_preview'), "method_type": str(type(getattr(self, '_generate_translation_preview', None)))})
             
             # Generate translation preview (text preview before rendering) - COMPLETELY INLINE, NO METHOD DEPENDENCY
-            _dbg_log("H17", "translate_document:preview_start", "starting inline preview generation", {})
+
             try:
                 preview_lines = []
                 preview_lines.append("=" * 60)
@@ -420,9 +383,7 @@ class SciTransGUI:
                 else:
                     translation_preview_text = "\n".join(preview_lines)
                 
-                _dbg_log("H18", "translate_document:preview_success", "preview generated inline", {"block_count": block_count, "length": len(translation_preview_text)})
             except Exception as preview_error:
-                _dbg_log("H19", "translate_document:preview_error", "Exception in inline preview", {"error": str(preview_error), "type": type(preview_error).__name__})
                 translation_preview_text = f"Translation completed: {result.blocks_translated}/{total_blocks} blocks translated.\n\nPreview generation error: {str(preview_error)}"
                 add_log(f"⚠️ Preview generation failed: {preview_error}")
             
@@ -436,14 +397,6 @@ class SciTransGUI:
                         page = b.bbox.page
                         translated_by_page[page] = translated_by_page.get(page, 0) + 1
             missing_blocks = [b.block_id for seg in document.segments for b in seg.blocks if not b.translated_text]
-            _dbg_log(
-                "H2",
-                "translate_document:translation_done",
-                "translation completed",
-                {
-                    "translated_blocks": result.blocks_translated,
-                    "total_blocks": total_blocks,
-                    "missing_count": len(missing_blocks),
                     "missing_sample": missing_blocks[:10],
                 },
             )
@@ -455,8 +408,6 @@ class SciTransGUI:
             progress(0.9, desc="Rendering PDF...")
             add_log("Rendering translated PDF (clearing source text, preserving layout)...")
             
-            _dbg_log("H21", "translate_document:before_rendering", "about to render PDF", {
-                "has_document": "document" in locals(),
                 "has_result": "result" in locals(),
                 "blocks_translated": result.blocks_translated if "result" in locals() else 0
             })
@@ -466,21 +417,15 @@ class SciTransGUI:
             temp_output_dir.mkdir(exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             temp_output_path = temp_output_dir / f"{input_path.stem}_{target_lang}_{timestamp}.pdf"
-            
-            _dbg_log("H22", "translate_document:before_renderer_init", "about to create PDFRenderer", {})
-            
+
             renderer = PDFRenderer(
                 font_dir=font_dir if font_dir else None,
                 font_files=[f.strip() for f in font_files.split(",") if f.strip()] if font_files else None,
                 font_priority=[p.strip().lower() for p in font_priority.split(",") if p.strip()] if font_priority else None
             )
-            
-            _dbg_log("H23", "translate_document:before_render_call", "about to call render_with_layout", {})
-            
+
             renderer.render_with_layout(str(input_path), result.document, str(temp_output_path))
             
-            _dbg_log("H24", "translate_document:after_render", "render_with_layout completed", {
-                "output_exists": temp_output_path.exists() if "temp_output_path" in locals() else False,
                 "output_path": str(temp_output_path) if "temp_output_path" in locals() else "N/A",
                 "output_extension": str(temp_output_path.suffix) if "temp_output_path" in locals() and temp_output_path.exists() else "N/A",
                 "output_size_bytes": temp_output_path.stat().st_size if "temp_output_path" in locals() and temp_output_path.exists() else 0
@@ -491,16 +436,11 @@ class SciTransGUI:
                 import fitz
                 with fitz.open(str(temp_output_path)) as out_pdf:
                     translated_pages = len(out_pdf)
-                    _dbg_log("H28", "translate_document:page_count", "counted pages in output PDF", {
-                        "translated_pages": translated_pages,
-                        "source_pages": document.stats.get("num_pages", 0),
                         "output_file_exists": temp_output_path.exists(),
                         "output_file_size_kb": temp_output_path.stat().st_size / 1024 if temp_output_path.exists() else 0
                     })
             except Exception as e:
                 translated_pages = document.stats.get("num_pages", 1)
-                _dbg_log("H28", "translate_document:page_count_error", "error counting pages", {
-                    "error": str(e),
                     "fallback_pages": translated_pages
                 })
             
@@ -521,7 +461,7 @@ class SciTransGUI:
                 # Return all 9 values for error case
                 return (
                     "Error: PDF not created",
-                    gr.update(value=None, visible=False),
+                    gr.update(value=None, visible=False, interactive=False),
                     "\n".join(logs),
                     None,
                     "of 0",
@@ -559,36 +499,19 @@ class SciTransGUI:
                 perf_text += f"• Batch translated: {stats.get('batch_translated', 0)}\n"
                 perf_text += f"• Batch cached: {stats.get('batch_cache_hits', 0)}"
             
-            _dbg_log("H25", "translate_document:before_preview_pdf", "about to call preview_pdf", {
-                "has_temp_output_path": "temp_output_path" in locals(),
                 "temp_path": str(temp_output_path) if "temp_output_path" in locals() else "N/A"
             })
             
-            trans_preview = self.preview_pdf(str(temp_output_path), 1)
-            
-            _dbg_log("H26", "translate_document:after_preview_pdf", "preview_pdf completed", {
-                "has_preview": trans_preview is not None
+            # Return PDF file path for File component
+                "preview_path": str(temp_output_path) if "temp_output_path" in locals() else None
             })
-            
-            # Return the temp PDF file path (Gradio can access temp directory)
-            # Show translated preview, or loading image if translation failed
-            final_preview = trans_preview if trans_preview else loading_img
             page_update = gr.update(maximum=max(1, translated_pages), value=1)
             page_total_text = f"of {max(1, translated_pages)}"
-            _dbg_log(
-                "H3",
-                "translate_document:render_done",
-                "render completed",
-                {
-                    "translated_pages": translated_pages,
-                    "output_temp": str(temp_output_path),
                     "output_persistent": str(persistent_output_path),
                 },
             )
             
             # Log before return to catch any errors during return
-            _dbg_log("H20", "translate_document:before_return", "about to return success", {
-                "has_preview": "translation_preview_text" in locals(),
                 "preview_length": len(translation_preview_text) if "translation_preview_text" in locals() else 0,
                 "return_count": 9,
                 "output_file_path": str(temp_output_path) if "temp_output_path" in locals() else "N/A",
@@ -599,12 +522,12 @@ class SciTransGUI:
             
             return (
                 status,
-                gr.update(value=str(temp_output_path), visible=True),
+                gr.update(value=str(temp_output_path), visible=True, interactive=True),
                 "\n".join(logs),
-                final_preview,
+                str(temp_output_path),  # Return PDF file path for File component
                 page_total_text,
                 page_update,
-                final_preview,
+                str(input_path),  # Return source PDF path for File component
                 perf_text,
                 translation_preview_text,
             )
@@ -644,15 +567,12 @@ class SciTransGUI:
             try:
                 import traceback as tb
                 full_traceback = tb.format_exc()
-                _dbg_log("H9", "translate_document:error", "translate failed", {
-                    "error": str(e),
                     "error_type": type(e).__name__,
                     "traceback": full_traceback,
                     "has_method": hasattr(self, '_generate_translation_preview'),
                     "method_exists": '_generate_translation_preview' in dir(self) if hasattr(self, '__dict__') else False
                 })
             except:
-                # If _dbg_log fails, continue anyway
                 pass
             
             try:
@@ -682,7 +602,7 @@ class SciTransGUI:
             # Final return - guaranteed to return 9 values
             return (
                 full_error,
-                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False, interactive=False),
                 logs_str,
                 None,
                 "of 0",
@@ -744,26 +664,15 @@ class SciTransGUI:
             return f"Error generating preview: {str(e)}"
     
     def preview_pdf(self, pdf_file, page_num=1):
-        """Preview PDF page."""
+        """Preview PDF page - returns PDF file path for File component."""
         if pdf_file is None:
             return None
         try:
-            import fitz
-            from PIL import Image, ImageDraw, ImageFont
-            import io
-            
+            # Return the PDF file path directly - Gradio File component will render PDFs natively
             pdf_path = pdf_file.name if hasattr(pdf_file, 'name') else str(pdf_file)
-            doc = fitz.open(pdf_path)
-            page_idx = max(0, min(int(page_num) - 1, len(doc) - 1))
-            page = doc[page_idx]
-            
-            zoom = 1.2
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat)
-            img_data = pix.tobytes("png")
-            doc.close()
-            
-            return Image.open(io.BytesIO(img_data))
+            if isinstance(pdf_path, str) and pdf_path.endswith('.pdf'):
+                return pdf_path
+            return None
         except Exception as e:
             print(f"Preview error: {e}")
             return None
@@ -2119,7 +2028,9 @@ class SciTransGUI:
                                             lines=4, 
                                             interactive=False, 
                                             show_label=False,
-                                            placeholder="Status will appear here..."
+                                            placeholder="Status will appear here...",
+                                            max_lines=20,  # Make scrollable
+                                            scroll=True
                                         )
                                     with gr.Tab("Log"):
                                         log_box = gr.Textbox(
@@ -2127,14 +2038,18 @@ class SciTransGUI:
                                             interactive=False, 
                                             show_label=False, 
                                             autoscroll=True,
-                                            placeholder="Translation logs will appear here..."
+                                            placeholder="Translation logs will appear here...",
+                                            max_lines=100,  # Make scrollable
+                                            scroll=True
                                         )
                                     with gr.Tab("Performance"):
                                         perf_info = gr.Textbox(
                                             lines=4,
                                             interactive=False,
                                             show_label=False,
-                                            placeholder="Performance metrics will appear here..."
+                                            placeholder="Performance metrics will appear here...",
+                                            max_lines=20,  # Make scrollable
+                                            scroll=True
                                         )
                         
                         # Right: Preview (wider) - Preview replaces progress/status area
@@ -2148,15 +2063,20 @@ class SciTransGUI:
                             )
                             
                             # Preview area with fullscreen support
-                            with gr.Tabs():
+                            # Use File components for PDF previews (Gradio will render PDFs natively)
+                            with gr.Tabs(selected=0):  # selected=0 prevents auto-switching
                                 with gr.Tab("Source"):
-                                    source_preview = gr.Image(
+                                    source_preview = gr.File(
+                                        label="Source PDF Preview",
+                                        file_types=[".pdf"],
                                         height=480,
                                         show_label=False,
                                         container=False
                                     )
                                 with gr.Tab("Translated"):
-                                    trans_preview = gr.Image(
+                                    trans_preview = gr.File(
+                                        label="Translated PDF Preview",
+                                        file_types=[".pdf"],
                                         height=480,
                                         show_label=False,
                                         container=False
@@ -2166,7 +2086,9 @@ class SciTransGUI:
                                         lines=20,
                                         label="Translation Preview (Before Rendering)",
                                         interactive=False,
-                                        placeholder="Translation preview will appear here after translation completes..."
+                                        placeholder="Translation preview will appear here after translation completes...",
+                                        max_lines=200,  # Make scrollable for long previews
+                                        scroll=True
                                     )
                             
                             # Loading indicator (shown during translation)
@@ -2218,7 +2140,7 @@ See: https://arxiv.org/abs/1234.5678 for more details.""",
                                 label="Sample Text (includes headers, bullets, math, URLs)", lines=8
                             )
                             test_backend_btn = gr.Button("▶ Test Backend")
-                            test_backend_result = gr.Textbox(label="Result", lines=6)
+                            test_backend_result = gr.Textbox(label="Result", lines=6, max_lines=50, scroll=True)
                         
                         with gr.Column():
                             gr.Markdown("**🎭 Masking Test**")
@@ -2237,19 +2159,19 @@ References:
                                 label="Test Input (LaTeX, URLs, code, emails)", lines=8
                             )
                             test_masking_btn = gr.Button("▶ Test Masking")
-                            test_masking_result = gr.Textbox(label="Result", lines=6)
+                            test_masking_result = gr.Textbox(label="Result", lines=6, max_lines=50, scroll=True)
                     
                     with gr.Row():
                         with gr.Column():
                             gr.Markdown("**📄 Layout Test**\nTest font detection, headers, footers, structure.")
                             layout_pdf = gr.File(label="Upload PDF to analyze layout", file_types=[".pdf"])
                             test_layout_btn = gr.Button("▶ Test Layout")
-                            test_layout_result = gr.Textbox(label="Result", lines=6)
+                            test_layout_result = gr.Textbox(label="Result", lines=6, max_lines=50, scroll=True)
                         
                         with gr.Column():
                             gr.Markdown("**💾 Cache Test**\nVerify translation caching is working.")
                             test_cache_btn = gr.Button("▶ Test Cache")
-                            test_cache_result = gr.Textbox(label="Result", lines=6)
+                            test_cache_result = gr.Textbox(label="Result", lines=6, max_lines=50, scroll=True)
                     
                     # Additional test samples
                     with gr.Accordion("📝 More Test Samples", open=False):
@@ -2317,7 +2239,7 @@ Copy these to test different formatting:
                                 save_key_btn = gr.Button("💾 Save Key", variant="primary")
                                 delete_key_btn = gr.Button("🗑️ Delete Key", variant="stop")
                             
-                            api_status = gr.Textbox(label="Status", lines=2, interactive=False)
+                            api_status = gr.Textbox(label="Status", lines=2, interactive=False, max_lines=10, scroll=True)
                             
                             # Refresh button for API keys table
                             refresh_keys_btn = gr.Button("🔄 Refresh Keys Table", variant="secondary", size="sm")
@@ -2610,27 +2532,25 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                 self.translated_pdf_path = None
                 if pdf is None:
                     return None, None, gr.update(maximum=1, value=1), "of 1"
-                preview = self.preview_pdf(pdf, 1)
+                # Return PDF file path directly for File component
+                pdf_path = pdf.name if hasattr(pdf, 'name') else str(pdf)
                 count = self.get_page_count(pdf)
-                return preview, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}"
+                return pdf_path, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}"
             
             pdf_upload.change(fn=on_upload, inputs=[pdf_upload], outputs=[source_preview, trans_preview, page_slider, page_total])
             
             # Unified page navigation for source and translated previews
+            # Note: With File components showing full PDFs, page navigation is handled by the PDF viewer
+            # Just return the file paths - user can navigate within the PDF viewer
             def nav_page(pdf, page, total, direction):
-                doc_path = self.translated_pdf_path if getattr(self, "translated_pdf_path", None) else pdf
-                if doc_path is None:
-                    return None, None, page
+                pdf_path = pdf.name if hasattr(pdf, 'name') else str(pdf) if pdf else None
+                doc_path = self.translated_pdf_path if getattr(self, "translated_pdf_path", None) else None
                 try:
                     max_p = int(str(total).replace("of", "").strip())
                 except Exception:
                     max_p = 1
                 new_p = max(1, min(max_p, int(page) + direction))
-                src_prev_img = self.preview_pdf(pdf, new_p) if pdf else None
-                trans_prev_img = None
-                if getattr(self, "translated_pdf_path", None):
-                    trans_prev_img = self.preview_pdf(self.translated_pdf_path, new_p)
-                return src_prev_img, trans_prev_img, new_p
+                return pdf_path, doc_path, new_p
             
             page_prev.click(
                 fn=lambda p, pg, t: nav_page(p, pg, t, -1),

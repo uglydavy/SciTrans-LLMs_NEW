@@ -31,6 +31,7 @@ class LibreTranslateBackend(TranslationBackend):
 
         try:
             resp = requests.post(url, json=payload, timeout=8)
+            resp.encoding = 'utf-8'  # Ensure UTF-8 encoding for special characters
             resp.raise_for_status()
             
             # Check if response has content

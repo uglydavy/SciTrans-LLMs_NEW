@@ -27,7 +27,6 @@ from scitran.scoring.reranker import AdvancedReranker, ScoringStrategy
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class PipelineConfig:
     """Complete configuration for the translation pipeline."""
@@ -132,7 +131,6 @@ class PipelineConfig:
             
         return issues
 
-
 class TranslationPipeline:
     """
     Main translation pipeline implementing all three innovations.
@@ -218,7 +216,6 @@ class TranslationPipeline:
         self.progress_callback = progress_callback
         # Keep a reference for batch heuristics
         self.document = document
-        self._dbg_log("H0", "pipeline:start", "translate_document start", {"pages": document.stats.get("num_pages", 0)})
         
         # Initialize result
         result = TranslationResult(
@@ -284,21 +281,11 @@ class TranslationPipeline:
             result.success = result.blocks_failed == 0
             
             self._report_progress(1.0, "Translation complete!")
-            self._dbg_log(
-                "H5",
-                "pipeline:complete",
-                "translate_document complete",
-                {
-                    "duration_sec": time.time() - start_time,
-                    "blocks_translated": result.blocks_translated,
-                    "blocks_failed": result.blocks_failed,
-                    "mask_violations": self.stats.get('mask_violations', 0),
-                    "cache_hits": self.stats.get('cache_hits', 0),
-                    "cache_misses": self.stats.get('cache_misses', 0),
-                },
-            )
             
         except Exception as e:
+
+            import traceback
+
             logger.error(f"Pipeline error: {e}")
             result.success = False
             result.error = str(e)
@@ -309,23 +296,20 @@ class TranslationPipeline:
     
     def _setup_translation(self, document: Document):
         """Initialize translation components."""
+
         # SPRINT 3: Load glossary using GlossaryManager
         # SPRINT 4: Skip if ablation disabled
         if self.config.enable_glossary and not self.config.ablation_disable_glossary:
             self.glossary_manager = self._setup_glossary_manager()
             # Keep legacy glossary dict for compatibility
             self.glossary = self.glossary_manager.to_dict() if self.glossary_manager else {}
-            self._dbg_log("H1", "pipeline:glossary_loaded", "glossary loaded", {
-                "entries": len(self.glossary_manager) if self.glossary_manager else 0,
-                "domains": list(self.glossary_manager.domains_loaded) if self.glossary_manager else []
-            })
         else:
             self.glossary_manager = None
             self.glossary = {}
             
         # Initialize translator
         self.translator = self._create_translator()
-        
+
         # Reset statistics
         self.stats = {k: 0 for k in self.stats.keys()}
         
@@ -939,7 +923,17 @@ Provide only the refined translation, with no explanations."""
         
         # Apply translations with fallback for any missing results
         failed_block_ids = []
+
+        blocks_by_page_before = {}
+        blocks_by_page_after = {}
+
         for block, translation in zip(blocks, translations):
+
+            page_num = block.bbox.page if block.bbox else -1
+            if page_num not in blocks_by_page_before:
+                blocks_by_page_before[page_num] = {"total": 0, "has_translation": 0}
+            blocks_by_page_before[page_num]["total"] += 1
+
             source_text = block.masked_text or block.source_text
             final_translation = self._postprocess_translation(translation) if translation else translation
             
@@ -960,9 +954,17 @@ Provide only the refined translation, with no explanations."""
             else:
                 block.translated_text = final_translation
                 self.stats['blocks_succeeded'] += 1
-            
+
+            if page_num not in blocks_by_page_after:
+                blocks_by_page_after[page_num] = {"total": 0, "translated": 0, "failed": 0}
+            blocks_by_page_after[page_num]["total"] += 1
+            if block.translated_text:
+                blocks_by_page_after[page_num]["translated"] += 1
+            else:
+                blocks_by_page_after[page_num]["failed"] += 1
+
             self.stats['blocks_processed'] += 1
-        
+
         if failed_block_ids:
             # Count failures before retry so we can adjust stats when retries succeed
             self.stats['blocks_failed'] += len(failed_block_ids)
@@ -981,16 +983,6 @@ Provide only the refined translation, with no explanations."""
         cached = fast_stats.get('cached', 0)
         translated = fast_stats.get('translated', 0)
         self._report_progress(0.8, f"Done: {cached} cached, {translated} new translations")
-        self._dbg_log(
-            "H3",
-            "pipeline:batch_done",
-            "batch translation finished",
-            {
-                "cached": cached,
-                "translated": translated,
-                "failed_blocks": self.stats.get("blocks_failed", 0),
-            },
-        )
     
     def _translate_blocks_sequential(self, document: Document):
         """Translate blocks sequentially with caching support."""
@@ -1166,6 +1158,9 @@ Provide only the refined translation, with no explanations."""
                 return user_prompt
                 
         except Exception as e:
+
+            import traceback
+
             logger.error(f"Translation error: {e}")
             return user_prompt
     
@@ -1250,26 +1245,6 @@ Provide only the refined translation, with no explanations."""
         return text
 
     # ---------- Helpers ----------
-    def _dbg_log(self, hid: str, loc: str, message: str, data: Dict[str, Any]):
-        """Write debug info to session log (used in debug mode)."""
-        if not getattr(self.config, "debug_mode", False):
-            return
-        log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
-        try:
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            payload = {
-                "sessionId": "debug-session",
-                "runId": "post-fix",
-                "hypothesisId": hid,
-                "location": loc,
-                "message": message,
-                "data": data,
-                "timestamp": int(time.time() * 1000),
-            }
-            with open(log_path, "a") as f:
-                f.write(json.dumps(payload) + "\n")
-        except Exception:
-            pass
 
     def _strip_control_chars(self, text: str) -> str:
         return "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
@@ -1411,7 +1386,7 @@ Provide only the refined translation, with no explanations."""
             backend_override: Use this backend instead of config.backend (for fallback)
         """
         backend_name = (backend_override or self.config.backend).lower()
-        
+
         try:
             if backend_name == "cascade":
                 from scitran.translation.backends.cascade_backend import CascadeBackend
@@ -1448,9 +1423,15 @@ Provide only the refined translation, with no explanations."""
                 from scitran.translation.backends.cascade_backend import CascadeBackend
                 return CascadeBackend()
         except ImportError as e:
+
+            import traceback
+
             logger.error(f"Could not import backend {backend_name}: {e}")
             return None
         except Exception as e:
+
+            import traceback
+
             logger.error(f"Error creating backend {backend_name}: {e}")
             return None
     

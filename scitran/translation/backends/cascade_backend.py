@@ -169,6 +169,7 @@ class CascadeBackend(TranslationBackend):
         url = f"{self.lingva_url}/{request.source_lang}/{request.target_lang}/{encoded_text}"
         
         response = requests.get(url, timeout=10)
+        response.encoding = 'utf-8'  # Ensure UTF-8 encoding for special characters
         response.raise_for_status()
         
         data = response.json()
@@ -191,6 +192,7 @@ class CascadeBackend(TranslationBackend):
         }
         
         response = requests.post(url, json=payload, timeout=15)
+        response.encoding = 'utf-8'  # Ensure UTF-8 encoding for special characters
         response.raise_for_status()
         
         data = response.json()
@@ -206,6 +208,7 @@ class CascadeBackend(TranslationBackend):
         }
         
         response = requests.get(url, params=params, timeout=15)
+        response.encoding = 'utf-8'  # Ensure UTF-8 encoding for special characters
         response.raise_for_status()
         
         data = response.json()
