@@ -51,11 +51,16 @@ dmypy.json
 *.log
 logs/
 debug.log
+debug.jsonl
 
 # Cache
 .cache/
 *.cache
 .scitran_cache/
+
+# Runtime artifacts
+artifacts/
+overflow_report.json
 
 # API Keys (IMPORTANT!)
 configs/keys.yaml
@@ -83,7 +88,10 @@ temp/
 # OS
 .DS_Store
 Thumbs.db
+__MACOSX/
 
 # Project specific
 translations.db
 .scitrans/
+*_translated.pdf
+*_translated_*.pdf

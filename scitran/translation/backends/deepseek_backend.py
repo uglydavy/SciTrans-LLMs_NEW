@@ -16,6 +16,8 @@ from ..base import TranslationBackend, TranslationRequest, TranslationResponse
 class DeepSeekBackend(TranslationBackend):
     """DeepSeek-based translation backend (uses OpenAI-compatible API)."""
     
+    supports_batch_candidates = True  # DeepSeek supports n parameter
+    
     BASE_URL = "https://api.deepseek.com"
     
     MODELS = {
@@ -27,15 +29,20 @@ class DeepSeekBackend(TranslationBackend):
         if not HAS_OPENAI:
             raise ImportError("openai package required for DeepSeek. Run: pip install openai")
         
+        # Load API key from parameter or environment
         api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        
+        if not api_key:
+            raise ValueError(
+                "DeepSeek API key not found. Set DEEPSEEK_API_KEY environment variable "
+                "or pass api_key parameter. Get your key at: https://platform.deepseek.com/"
+            )
+        
         super().__init__(api_key, model)
         
-        if self.api_key:
-            self.client = OpenAI(api_key=self.api_key, base_url=self.BASE_URL)
-            self.async_client = AsyncOpenAI(api_key=self.api_key, base_url=self.BASE_URL)
-        else:
-            self.client = None
-            self.async_client = None
+        # Initialize clients with official DeepSeek base URL
+        self.client = OpenAI(api_key=self.api_key, base_url=self.BASE_URL)
+        self.async_client = AsyncOpenAI(api_key=self.api_key, base_url=self.BASE_URL)
     
     def _build_messages(self, request: TranslationRequest):
         """Build messages for DeepSeek API."""
@@ -68,20 +75,19 @@ class DeepSeekBackend(TranslationBackend):
         messages = self._build_messages(request)
         
         try:
-            translations = []
-            tokens_used = 0
+            # Use n parameter for batch candidates (single API call)
+            n = max(1, request.num_candidates)
+            response = await self.async_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=request.temperature,
+                n=n,
+                max_tokens=4096
+            )
             
-            for _ in range(request.num_candidates):
-                response = await self.async_client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=request.temperature,
-                    max_tokens=4096
-                )
-                
-                translations.append(response.choices[0].message.content.strip())
-                if response.usage:
-                    tokens_used += response.usage.total_tokens
+            translations = [choice.message.content.strip() for choice in response.choices]
+            finish_reasons = [choice.finish_reason for choice in response.choices]
+            tokens_used = response.usage.total_tokens if response.usage else 0
             
             cost_per_1k = self.MODELS.get(self.model, {}).get("cost_per_1k", 0.00014)
             cost = (tokens_used / 1000) * cost_per_1k
@@ -93,7 +99,12 @@ class DeepSeekBackend(TranslationBackend):
                 model=self.model,
                 tokens_used=tokens_used,
                 cost=cost,
-                latency=latency
+                latency=latency,
+                finish_reasons=finish_reasons,
+                metadata={
+                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+                }
             )
             
         except Exception as e:
@@ -108,20 +119,19 @@ class DeepSeekBackend(TranslationBackend):
         messages = self._build_messages(request)
         
         try:
-            translations = []
-            tokens_used = 0
+            # Use n parameter for batch candidates (single API call)
+            n = max(1, request.num_candidates)
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=request.temperature,
+                n=n,
+                max_tokens=4096
+            )
             
-            for _ in range(request.num_candidates):
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=request.temperature,
-                    max_tokens=4096
-                )
-                
-                translations.append(response.choices[0].message.content.strip())
-                if response.usage:
-                    tokens_used += response.usage.total_tokens
+            translations = [choice.message.content.strip() for choice in response.choices]
+            finish_reasons = [choice.finish_reason for choice in response.choices]
+            tokens_used = response.usage.total_tokens if response.usage else 0
             
             cost_per_1k = self.MODELS.get(self.model, {}).get("cost_per_1k", 0.00014)
             cost = (tokens_used / 1000) * cost_per_1k
@@ -133,7 +143,12 @@ class DeepSeekBackend(TranslationBackend):
                 model=self.model,
                 tokens_used=tokens_used,
                 cost=cost,
-                latency=latency
+                latency=latency,
+                finish_reasons=finish_reasons,
+                metadata={
+                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+                }
             )
             
         except Exception as e:

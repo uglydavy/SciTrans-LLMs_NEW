@@ -31,10 +31,14 @@ class TranslationResponse:
     cost: float = 0.0
     latency: float = 0.0
     metadata: Dict = None
+    finish_reasons: List[str] = None  # Track truncation: "stop", "length", etc.
 
 
 class TranslationBackend(ABC):
     """Abstract base class for translation backends."""
+    
+    # Backend capability flags
+    supports_batch_candidates = False  # Can return N candidates in one API call
     
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key

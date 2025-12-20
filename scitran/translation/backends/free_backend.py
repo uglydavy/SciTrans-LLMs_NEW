@@ -86,7 +86,10 @@ class FreeBackend(TranslationBackend):
                 tokens_used=0,
                 cost=0.0,
                 latency=latency,
-                metadata={"warning": "Free translation may not preserve technical terms and formatting"}
+                finish_reasons=["stop"] * len(translations),
+                metadata={
+                    "warning": "Free backends may struggle with mask placeholders. Consider using paid backends for documents with LaTeX/equations."
+                }
             )
             
         except Exception as google_error:

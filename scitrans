@@ -32,22 +32,6 @@ from gui.app import launch
 launch()
 "
         ;;
-    translate)
-        shift
-        exec "$PYTHON" -m cli.commands.main translate "$@"
-        ;;
-    test)
-        exec "$PYTHON" -m cli.commands.main test "$@"
-        ;;
-    backends)
-        exec "$PYTHON" -m cli.commands.main backends "$@"
-        ;;
-    wizard)
-        exec "$PYTHON" -m cli.commands.main wizard
-        ;;
-    cli)
-        exec "$PYTHON" -m cli.commands.main "$@"
-        ;;
     help|--help|-h)
         cat << EOF
 SciTrans LLMs - Scientific Document Translation
@@ -58,6 +42,12 @@ Usage:
   scitrans translate <pdf> -o out  Translate with output path
   scitrans test                    Run system tests
   scitrans backends                List available backends
+  scitrans info                    Show system information
+  scitrans info <pdf>              Show PDF information
+  scitrans keys list               List API keys
+  scitrans keys set -b <name> -k <key>  Set API key
+  scitrans keys delete -b <name>   Delete API key
+  scitrans keys check              Check API key availability
   scitrans wizard                  Interactive wizard
   scitrans cli                     Enter CLI mode
   scitrans help                    Show this help
@@ -66,10 +56,13 @@ Examples:
   scitrans gui
   scitrans translate paper.pdf
   scitrans translate paper.pdf --backend openai -o translated.pdf
+  scitrans info
+  scitrans keys set -b openai -k sk-...
+  scitrans backends
 EOF
         ;;
     *)
-        # Default: pass to CLI
+        # Default: pass all arguments to CLI
         exec "$PYTHON" -m cli.commands.main "$@"
         ;;
 esac

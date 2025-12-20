@@ -182,10 +182,12 @@ def show_help():
     Example:
       ./scitrans backends
 
+  [bold]info[/bold]                    Show system information
   [bold]info[/bold] <file>             Show PDF document information
     
-    Example:
-      ./scitrans info paper.pdf
+    Examples:
+      ./scitrans info                 # Show system info
+      ./scitrans info paper.pdf       # Show PDF info
 
   [bold]test[/bold]                    Test translation quality
     Options:
@@ -208,6 +210,18 @@ def show_help():
     
     Example:
       ./scitrans gui
+
+  [bold]keys[/bold]                    Manage API keys
+    Subcommands:
+      list                   List configured API keys
+      set -b <name> -k <key> Set API key for a backend
+      delete -b <name>       Delete API key for a backend
+      check                  Check API key availability
+    
+    Examples:
+      ./scitrans keys list
+      ./scitrans keys set -b openai -k sk-...
+      ./scitrans keys check
 
 [yellow]BACKENDS:[/yellow]
 
@@ -282,11 +296,34 @@ def show_backend_details():
         OllamaBackend, FreeBackend, CascadeBackend, HuggingFaceBackend
     )
     
+    # Load API keys from config file
+    import os
+    from pathlib import Path
+    from scitran.utils.config_loader import load_config
+    
+    config_path = Path.home() / ".scitrans" / "config.yaml"
+    api_keys = {}
+    if config_path.exists():
+        try:
+            config = load_config(str(config_path))
+            api_keys = config.get("api_keys", {})
+        except:
+            pass
+    
+    # Also check environment variables (they take precedence)
+    env_mappings = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "huggingface": "HUGGINGFACE_API_KEY"
+    }
+    
     backends = [
         {
             "name": "Cascade (Smart Failover)",
             "class": CascadeBackend,
             "model": "multi-service",
+            "key_name": None,
             "cost": "FREE ✓",
             "quality": "⭐⭐⭐",
             "speed": "Fast",
@@ -297,6 +334,7 @@ def show_backend_details():
             "name": "Free (Google)",
             "class": FreeBackend,
             "model": "google",
+            "key_name": None,
             "cost": "FREE ✓",
             "quality": "⭐⭐⭐",
             "speed": "Fast",
@@ -307,6 +345,7 @@ def show_backend_details():
             "name": "HuggingFace",
             "class": HuggingFaceBackend,
             "model": "Helsinki-NLP/opus-mt-en-fr",
+            "key_name": "huggingface",
             "cost": "FREE ✓",
             "quality": "⭐⭐⭐⭐",
             "speed": "Medium",
@@ -317,6 +356,7 @@ def show_backend_details():
             "name": "Ollama (Local)",
             "class": OllamaBackend,
             "model": "llama3.1",
+            "key_name": None,
             "cost": "FREE ✓",
             "quality": "⭐⭐⭐⭐",
             "speed": "Medium-Slow",
@@ -327,6 +367,7 @@ def show_backend_details():
             "name": "DeepSeek",
             "class": DeepSeekBackend,
             "model": "deepseek-chat",
+            "key_name": "deepseek",
             "cost": "$0.14/1M tokens",
             "quality": "⭐⭐⭐⭐",
             "speed": "Fast",
@@ -337,6 +378,7 @@ def show_backend_details():
             "name": "OpenAI GPT-4",
             "class": OpenAIBackend,
             "model": "gpt-4o",
+            "key_name": "openai",
             "cost": "$2.50/1M tokens",
             "quality": "⭐⭐⭐⭐⭐",
             "speed": "Fast",
@@ -347,6 +389,7 @@ def show_backend_details():
             "name": "Anthropic Claude",
             "class": AnthropicBackend,
             "model": "claude-3-5-sonnet",
+            "key_name": "anthropic",
             "cost": "$3.00/1M tokens",
             "quality": "⭐⭐⭐⭐⭐",
             "speed": "Medium",
@@ -357,7 +400,17 @@ def show_backend_details():
     
     for backend in backends:
         try:
-            instance = backend["class"](model=backend["model"])
+            # Get API key from environment (preferred) or config file
+            api_key = None
+            if backend["key_name"]:
+                # Check environment variable first
+                if backend["key_name"] in env_mappings:
+                    api_key = os.getenv(env_mappings[backend["key_name"]])
+                # Fall back to config file
+                if not api_key and backend["key_name"] in api_keys:
+                    api_key = api_keys[backend["key_name"]]
+            
+            instance = backend["class"](api_key=api_key, model=backend["model"])
             status = "✓ READY" if instance.is_available() else "⚠ NOT CONFIGURED"
             status_color = "green" if instance.is_available() else "yellow"
         except:

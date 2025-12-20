@@ -71,6 +71,7 @@ class FontInfo:
     weight: str = "normal"  # normal, bold
     style: str = "normal"   # normal, italic
     color: str = "#000000"  # RGB hex
+    alignment: str = "left"  # left, center, right, justify (inferred from position)
 
 
 @dataclass
@@ -95,6 +96,17 @@ class TranslationMetadata:
     reranking_applied: bool = False     # Whether reranking was applied
     prompt_template: Optional[str] = None  # Prompt template used
     model_name: Optional[str] = None    # Specific model used
+    
+    # PHASE 2.3: Per-block status tracking
+    status: str = "pending"  # pending, translated_ok, translated_fallback, failed, skipped_nontranslatable, render_overflow
+    failure_reason: Optional[str] = None  # Reason if failed
+    finish_reason: Optional[str] = None  # From backend: "stop", "length", etc.
+    was_truncated: bool = False  # True if detected truncation
+    retry_count: int = 0  # Number of retries attempted
+    
+    # Mask restoration tracking (tolerant unmasking)
+    restored_masks: int = 0  # Number of masks successfully restored
+    missing_placeholders: List[str] = field(default_factory=list)  # Placeholders that couldn't be restored
     
 
 @dataclass
@@ -138,12 +150,14 @@ class Block:
         non_translatable = {
             BlockType.EQUATION,
             BlockType.CODE,
-            BlockType.FIGURE,
-            BlockType.TABLE,
+            BlockType.FIGURE,  # Figure images not translatable
+            BlockType.TABLE,   # Table content not translatable (complex layout)
             BlockType.HEADER,
             BlockType.FOOTER,
             BlockType.METADATA,
         }
+        # CAPTION is translatable (table/figure captions, labels)
+        # TITLE, HEADING, SUBHEADING, PARAGRAPH, etc. are translatable
         return self.block_type not in non_translatable
     
     @property
@@ -374,6 +388,7 @@ class TranslationResult:
     # SPRINT 1: Coverage guarantee metrics
     coverage: float = 1.0  # Ratio of successfully translated blocks (0-1)
     failure_report: Optional[Dict[str, Any]] = None  # Detailed failure info
+    validation_result: Optional[Any] = None  # ValidationResult from completeness validator
     
     # Detailed stats
     blocks_translated: int = 0

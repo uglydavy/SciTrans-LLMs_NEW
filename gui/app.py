@@ -40,6 +40,7 @@ class SciTransGUI:
         self.config_file.parent.mkdir(exist_ok=True)
         self.glossary_file = Path.home() / ".scitrans" / "glossary.json"
         self.translated_pdf_path = None
+        self.source_pdf_path = None  # Store source PDF path for preview
         self.log_queue = Queue()
         self.load_config()
         self.load_glossary()  # Load persistent glossary
@@ -92,6 +93,48 @@ class SciTransGUI:
         """Save configuration."""
         with open(self.config_file, 'w') as f:
             json.dump(self.config, f, indent=2)
+    
+    def _load_api_key_for_backend(self, backend: str) -> Optional[str]:
+        """Load API key for a backend from GUI config, environment, or config file.
+        
+        Args:
+            backend: Backend name
+            
+        Returns:
+            API key if found, None otherwise
+        """
+        backend_lower = backend.lower()
+        
+        # Check GUI config first
+        if hasattr(self, 'config') and self.config.get("api_keys", {}).get(backend_lower):
+            return self.config["api_keys"][backend_lower]
+        
+        # Check environment variables
+        env_mappings = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+            "huggingface": "HUGGINGFACE_API_KEY"
+        }
+        
+        if backend_lower in env_mappings:
+            api_key = os.getenv(env_mappings[backend_lower])
+            if api_key:
+                return api_key
+        
+        # Check config file (~/.scitrans/config.yaml)
+        config_path = Path.home() / ".scitrans" / "config.yaml"
+        if config_path.exists():
+            try:
+                from scitran.utils.config_loader import load_config
+                config = load_config(str(config_path))
+                api_keys = config.get("api_keys", {})
+                if backend_lower in api_keys:
+                    return api_keys[backend_lower]
+            except Exception:
+                pass
+        
+        return None
     
     def load_glossary(self):
         """Load persistent glossary from disk (SPRINT 3: Using GlossaryManager)."""
@@ -180,11 +223,34 @@ class SciTransGUI:
         # logs and add_log are already defined at function start (lines 157-158)
         
         try:
+            # Handle both file uploads and URL-downloaded PDFs
+            if pdf_file is None:
+                return (
+                    "❌ Error: No PDF file provided",
+                    gr.update(visible=False),
+                    "Please upload a PDF file or provide a URL.",
+                    None,
+                    "of 0",
+                    gr.update(maximum=1, value=1),
+                    None,
+                    "",
+                    ""
+                )
+            
+            # Get PDF path - handle both file objects and string paths
+            if isinstance(pdf_file, str):
+                input_path = pdf_file  # Already a path (from URL download)
+            elif hasattr(pdf_file, 'name'):
+                input_path = pdf_file.name  # File upload object
+            else:
+                input_path = str(pdf_file)
+            
             from scitran.extraction.pdf_parser import PDFParser
             from scitran.core.pipeline import TranslationPipeline, PipelineConfig
             from scitran.rendering.pdf_renderer import PDFRenderer
             
-            input_path = Path(pdf_file.name if hasattr(pdf_file, 'name') else pdf_file)
+            # Convert to Path object
+            input_path = Path(input_path)
             add_log(f"Input: {input_path.name}")
             
             progress(0.05, desc="Parsing PDF...")
@@ -239,6 +305,9 @@ class SciTransGUI:
             
             progress(0.1, desc="Configuring pipeline...")
             add_log(f"Backend: {backend}")
+            
+            # Validate and normalize model name for the selected backend
+            model_name = self.validate_model_for_backend(backend, model_name)
             if model_name and model_name != "default":
                 add_log(f"Model: {model_name}")
             
@@ -270,11 +339,18 @@ class SciTransGUI:
                 except (ValueError, TypeError):
                     return default
             
+            # Load API key for the selected backend
+            api_key = self._load_api_key_for_backend(backend)
+            
+            # PHASE 1.3: Check if fast mode should be enabled (no reranking + single candidate)
+            fast_mode_enabled = not enable_reranking and safe_int(num_candidates, 1) == 1
+            
             config = PipelineConfig(
                 source_lang=source_lang,
                 target_lang=target_lang,
                 backend=backend,
                 model_name=model_name if model_name and model_name != "default" else None,
+                api_key=api_key,  # Load API key from config/env
                 enable_masking=enable_masking,
                 enable_reranking=enable_reranking,
                 num_candidates=safe_int(num_candidates, 1) if enable_reranking else 1,
@@ -282,15 +358,17 @@ class SciTransGUI:
                 enable_glossary=use_glossary,
                 context_window_size=safe_int(context_window, 5),
                 quality_threshold=safe_float(quality_threshold, 0.7),
-                batch_size=safe_int(batch_size, 10),
+                batch_size=safe_int(batch_size, 20),  # Increased default for speed
                 prompt_optimization_rounds=safe_int(prompt_rounds, 0),
                 optimize_prompts=safe_int(prompt_rounds, 0) > 0,
                 debug_mode=True,
+                debug_log_path=Path(".cache/scitrans/gui_debug.jsonl"),  # PHASE 4.1
                 mask_custom_macros=bool(mask_custom_macros),
                 mask_apostrophes_in_latex=bool(mask_apostrophes_in_latex),
                 enable_parallel_processing=bool(enable_parallel),
                 max_workers=safe_int(max_workers, None) if max_workers and str(max_workers).strip() else None,
                 adaptive_concurrency=bool(adaptive_concurrency),
+                fast_mode=fast_mode_enabled,  # PHASE 1.3: Auto-enable when appropriate
             )
             
             pipeline = TranslationPipeline(config)
@@ -397,9 +475,6 @@ class SciTransGUI:
                         page = b.bbox.page
                         translated_by_page[page] = translated_by_page.get(page, 0) + 1
             missing_blocks = [b.block_id for seg in document.segments for b in seg.blocks if not b.translated_text]
-                    "missing_sample": missing_blocks[:10],
-                },
-            )
             
             add_log(f"Blocks with translation + bbox: {translated_with_bbox}")
             for page, count in sorted(translated_by_page.items()):
@@ -407,10 +482,6 @@ class SciTransGUI:
             
             progress(0.9, desc="Rendering PDF...")
             add_log("Rendering translated PDF (clearing source text, preserving layout)...")
-            
-                "has_result": "result" in locals(),
-                "blocks_translated": result.blocks_translated if "result" in locals() else 0
-            })
             
             # Save PDF to temp directory first (Gradio requirement), then copy to persistent location
             temp_output_dir = Path(tempfile.gettempdir()) / "scitrans"
@@ -421,28 +492,21 @@ class SciTransGUI:
             renderer = PDFRenderer(
                 font_dir=font_dir if font_dir else None,
                 font_files=[f.strip() for f in font_files.split(",") if f.strip()] if font_files else None,
-                font_priority=[p.strip().lower() for p in font_priority.split(",") if p.strip()] if font_priority else None
+                font_priority=[p.strip().lower() for p in font_priority.split(",") if p.strip()] if font_priority else None,
+                overflow_strategy="shrink",  # PHASE 3.2: Default to shrink for GUI
+                min_font_size=4.0
             )
 
             renderer.render_with_layout(str(input_path), result.document, str(temp_output_path))
             
-                "output_path": str(temp_output_path) if "temp_output_path" in locals() else "N/A",
-                "output_extension": str(temp_output_path.suffix) if "temp_output_path" in locals() and temp_output_path.exists() else "N/A",
-                "output_size_bytes": temp_output_path.stat().st_size if "temp_output_path" in locals() and temp_output_path.exists() else 0
-            })
             
             # Count translated pages for pagination
             try:
                 import fitz
                 with fitz.open(str(temp_output_path)) as out_pdf:
                     translated_pages = len(out_pdf)
-                        "output_file_exists": temp_output_path.exists(),
-                        "output_file_size_kb": temp_output_path.stat().st_size / 1024 if temp_output_path.exists() else 0
-                    })
             except Exception as e:
                 translated_pages = document.stats.get("num_pages", 1)
-                    "fallback_pages": translated_pages
-                })
             
             # Also copy to persistent location for user access
             # Keep final output in temp (Gradio requirement) and optionally mirror to home cache
@@ -472,6 +536,9 @@ class SciTransGUI:
                 )
             
             self.translated_pdf_path = str(temp_output_path)
+            # Keep source PDF path stored for preview
+            if not self.source_pdf_path:
+                self.source_pdf_path = str(input_path)
             
             progress(1.0, desc="Complete!")
             add_log("Translation complete!")
@@ -499,35 +566,28 @@ class SciTransGUI:
                 perf_text += f"• Batch translated: {stats.get('batch_translated', 0)}\n"
                 perf_text += f"• Batch cached: {stats.get('batch_cache_hits', 0)}"
             
-                "temp_path": str(temp_output_path) if "temp_output_path" in locals() else "N/A"
-            })
             
             # Return PDF file path for File component
-                "preview_path": str(temp_output_path) if "temp_output_path" in locals() else None
-            })
             page_update = gr.update(maximum=max(1, translated_pages), value=1)
             page_total_text = f"of {max(1, translated_pages)}"
-                    "output_persistent": str(persistent_output_path),
-                },
-            )
+            
+            # Store source PDF path if not already stored
+            if not self.source_pdf_path:
+                self.source_pdf_path = str(input_path)
             
             # Log before return to catch any errors during return
-                "preview_length": len(translation_preview_text) if "translation_preview_text" in locals() else 0,
-                "return_count": 9,
-                "output_file_path": str(temp_output_path) if "temp_output_path" in locals() else "N/A",
-                "output_file_exists": temp_output_path.exists() if "temp_output_path" in locals() else False,
-                "output_file_extension": str(temp_output_path.suffix) if "temp_output_path" in locals() else "N/A",
-                "output_file_size_kb": temp_output_path.stat().st_size / 1024 if "temp_output_path" in locals() and temp_output_path.exists() else 0
-            })
+            
+            # Ensure source path is a string for File component
+            source_path_str = self.source_pdf_path if self.source_pdf_path else (str(input_path) if input_path else None)
             
             return (
                 status,
                 gr.update(value=str(temp_output_path), visible=True, interactive=True),
                 "\n".join(logs),
-                str(temp_output_path),  # Return PDF file path for File component
+                str(temp_output_path),  # Return PDF file path for File component (translated)
                 page_total_text,
                 page_update,
-                str(input_path),  # Return source PDF path for File component
+                source_path_str,  # Return source PDF path for File component
                 perf_text,
                 translation_preview_text,
             )
@@ -567,11 +627,6 @@ class SciTransGUI:
             try:
                 import traceback as tb
                 full_traceback = tb.format_exc()
-                    "error_type": type(e).__name__,
-                    "traceback": full_traceback,
-                    "has_method": hasattr(self, '_generate_translation_preview'),
-                    "method_exists": '_generate_translation_preview' in dir(self) if hasattr(self, '__dict__') else False
-                })
             except:
                 pass
             
@@ -716,6 +771,64 @@ class SciTransGUI:
         except:
             return 1
     
+    def download_pdf_from_url(self, url):
+        """Download PDF from URL and return file path."""
+        if not url or not url.strip():
+            return None, "Please enter a valid URL."
+        
+        try:
+            import requests
+            import tempfile
+            from pathlib import Path
+            
+            # Validate URL
+            if not url.startswith(('http://', 'https://')):
+                return None, "❌ Invalid URL. Must start with http:// or https://"
+            
+            # Download PDF
+            response = requests.get(url, timeout=30, stream=True)
+            response.raise_for_status()
+            
+            # Check content type
+            content_type = response.headers.get('content-type', '').lower()
+            if 'pdf' not in content_type and not url.lower().endswith('.pdf'):
+                # Still try if URL ends with .pdf
+                if not url.lower().endswith('.pdf'):
+                    return None, f"❌ URL does not appear to be a PDF (content-type: {content_type})"
+            
+            # Save to temporary file
+            temp_dir = Path.home() / ".scitrans" / "temp"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate filename from URL
+            filename = url.split('/')[-1] or "downloaded.pdf"
+            if not filename.endswith('.pdf'):
+                filename += '.pdf'
+            
+            temp_path = temp_dir / filename
+            
+            # Download file
+            with open(temp_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # Verify it's a valid PDF
+            try:
+                import fitz
+                doc = fitz.open(str(temp_path))
+                page_count = len(doc)
+                doc.close()
+                
+                return str(temp_path), f"✅ Downloaded PDF successfully ({page_count} pages)"
+            except Exception as e:
+                temp_path.unlink(missing_ok=True)
+                return None, f"❌ Downloaded file is not a valid PDF: {str(e)}"
+                
+        except requests.exceptions.RequestException as e:
+            return None, f"❌ Failed to download PDF: {str(e)}"
+        except Exception as e:
+            return None, f"❌ Error: {str(e)}"
+    
     def _get_model_options_for_backend(self, backend: str):
         """Return model choices, default value, and visibility for a backend."""
         model_options = {
@@ -740,7 +853,19 @@ class SciTransGUI:
     def update_model_options(self, backend):
         """Update model dropdown options based on selected backend."""
         opts = self._get_model_options_for_backend(backend)
+        # Always set value to first valid option to prevent "default" from persisting
+        # when switching to backends that don't support "default"
         return gr.update(choices=opts["choices"], value=opts["value"], visible=opts["visible"])
+    
+    def validate_model_for_backend(self, backend, model_name):
+        """Validate and normalize model name for the selected backend."""
+        opts = self._get_model_options_for_backend(backend)
+        valid_choices = opts["choices"]
+        
+        # If model is "default" or not in valid choices, use the first valid option
+        if model_name == "default" or model_name not in valid_choices:
+            return opts["value"]
+        return model_name
     
     # =========================================================================
     # Testing Functions
@@ -839,28 +964,119 @@ class SciTransGUI:
             return f"Error: {str(e)}"
     
     def test_layout(self, pdf_file):
-        """Test layout extraction."""
+        """Test layout extraction with detailed analysis."""
         if pdf_file is None:
             return "Default test: Layout extraction module OK.\n\nUpload a PDF to test with your document."
         
         try:
             import fitz
+            from scitran.core.models import BlockType
+            from scitran.extraction.pdf_parser import PDFParser
+            
             pdf_path = pdf_file.name if hasattr(pdf_file, 'name') else str(pdf_file)
             doc = fitz.open(pdf_path)
+            parser = PDFParser()
             
             result = f"PDF: {Path(pdf_path).name}\n"
-            result += f"Pages: {len(doc)}\n\n"
+            result += f"Total Pages: {len(doc)}\n"
+            result += "=" * 60 + "\n\n"
             
-            for i, page in enumerate(doc[:3]):  # First 3 pages
+            # Analyze first 3 pages in detail
+            for i, page in enumerate(doc[:3]):
                 result += f"Page {i+1}:\n"
                 result += f"  Size: {page.rect.width:.0f} x {page.rect.height:.0f}\n"
-                result += f"  Images: {len(page.get_images())}\n"
-                result += f"  Text blocks: {len(page.get_text('blocks'))}\n"
+                
+                # Images
+                images = page.get_images()
+                result += f"  Images: {len(images)}\n"
+                
+                # Extract text with detailed info
+                text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES)
+                
+                # Analyze fonts
+                fonts_used = {}
+                block_types = {}
+                tables_count = 0
+                equations_count = 0
+                figures_count = 0
+                
+                for block_data in text_dict.get("blocks", []):
+                    if "lines" not in block_data:
+                        figures_count += 1
+                        continue
+                    
+                    # Analyze fonts in this block
+                    for line in block_data.get("lines", []):
+                        for span in line.get("spans", []):
+                            font_name = span.get("font", "unknown")
+                            font_size = span.get("size", 11)
+                            flags = span.get("flags", 0)
+                            
+                            # Parse font style
+                            is_bold = bool(flags & 16)
+                            is_italic = bool(flags & 2)
+                            style = ""
+                            if is_bold and is_italic:
+                                style = "Bold+Italic"
+                            elif is_bold:
+                                style = "Bold"
+                            elif is_italic:
+                                style = "Italic"
+                            else:
+                                style = "Regular"
+                            
+                            font_key = f"{font_name} ({style}, {font_size:.1f}pt)"
+                            fonts_used[font_key] = fonts_used.get(font_key, 0) + 1
+                    
+                    # Classify block type
+                    block_text = ""
+                    for line in block_data.get("lines", []):
+                        for span in line.get("spans", []):
+                            block_text += span.get("text", "")
+                    
+                    if block_text.strip():
+                        # Use parser's classification
+                        classified = parser._classify_block(block_text)
+                        block_types[classified] = block_types.get(classified, 0) + 1
+                        
+                        if classified == "table":
+                            tables_count += 1
+                        elif classified == "math_content":
+                            equations_count += 1
+                
+                # Count text blocks
+                text_blocks = [b for b in text_dict.get("blocks", []) if "lines" in b]
+                result += f"  Text blocks: {len(text_blocks)}\n"
+                
+                # Font summary
+                if fonts_used:
+                    result += f"  Fonts used ({len(fonts_used)} unique):\n"
+                    # Sort by usage count
+                    sorted_fonts = sorted(fonts_used.items(), key=lambda x: x[1], reverse=True)
+                    for font_name, count in sorted_fonts[:5]:  # Top 5 fonts
+                        result += f"    • {font_name}: {count} spans\n"
+                    if len(sorted_fonts) > 5:
+                        result += f"    ... and {len(sorted_fonts) - 5} more\n"
+                
+                # Block types
+                if block_types:
+                    result += f"  Block types:\n"
+                    for block_type, count in sorted(block_types.items(), key=lambda x: x[1], reverse=True):
+                        result += f"    • {block_type}: {count}\n"
+                
+                # Special elements
+                result += f"  Special elements:\n"
+                result += f"    • Tables detected: {tables_count}\n"
+                result += f"    • Equations/formulas: {equations_count}\n"
+                result += f"    • Figures/images: {figures_count}\n"
+                
+                result += "\n"
             
             doc.close()
             return result
         except Exception as e:
-            return f"Error: {str(e)}"
+            import traceback
+            return f"Error: {str(e)}\n\n{traceback.format_exc()}"
     
     def test_cache(self):
         """Test cache functionality."""
@@ -887,53 +1103,9 @@ class SciTransGUI:
         """Machine Learning and AI scientific terms."""
         en_fr = {
             # Core ML concepts
-            "machine learning": "apprentissage automatique",
-            "deep learning": "apprentissage profond",
-            "neural network": "réseau de neurones",
-            "artificial intelligence": "intelligence artificielle",
-            "supervised learning": "apprentissage supervisé",
-            "unsupervised learning": "apprentissage non supervisé",
-            "reinforcement learning": "apprentissage par renforcement",
-            "training data": "données d'entraînement",
-            "test data": "données de test",
-            "validation set": "ensemble de validation",
-            "overfitting": "surapprentissage",
-            "underfitting": "sous-apprentissage",
-            "regularization": "régularisation",
-            "gradient descent": "descente de gradient",
-            "backpropagation": "rétropropagation",
-            "loss function": "fonction de perte",
-            "activation function": "fonction d'activation",
-            "learning rate": "taux d'apprentissage",
-            "batch size": "taille du lot",
-            "epoch": "époque",
             # Architecture terms
-            "convolutional neural network": "réseau de neurones convolutif",
-            "recurrent neural network": "réseau de neurones récurrent",
-            "transformer": "transformeur",
-            "attention mechanism": "mécanisme d'attention",
-            "self-attention": "auto-attention",
-            "encoder": "encodeur",
-            "decoder": "décodeur",
-            "embedding": "plongement",
-            "hidden layer": "couche cachée",
-            "dropout": "abandon",
-            "pooling": "agrégation",
             # NLP terms
-            "natural language processing": "traitement du langage naturel",
-            "language model": "modèle de langage",
-            "tokenization": "tokenisation",
-            "word embedding": "plongement de mots",
-            "sentiment analysis": "analyse de sentiment",
-            "named entity recognition": "reconnaissance d'entités nommées",
-            "machine translation": "traduction automatique",
-            "text classification": "classification de texte",
             # Computer Vision
-            "computer vision": "vision par ordinateur",
-            "image classification": "classification d'images",
-            "object detection": "détection d'objets",
-            "semantic segmentation": "segmentation sémantique",
-            "feature extraction": "extraction de caractéristiques",
         }
         if direction == "fr-en":
             return {v: k for k, v in en_fr.items()}
@@ -943,41 +1115,7 @@ class SciTransGUI:
         """Physics and mathematics scientific terms."""
         en_fr = {
             # Physics
-            "quantum mechanics": "mécanique quantique",
-            "quantum computing": "informatique quantique",
-            "wave function": "fonction d'onde",
-            "superposition": "superposition",
-            "entanglement": "intrication",
-            "relativity": "relativité",
-            "electromagnetic": "électromagnétique",
-            "thermodynamics": "thermodynamique",
-            "statistical mechanics": "mécanique statistique",
-            "particle physics": "physique des particules",
-            "string theory": "théorie des cordes",
-            "black hole": "trou noir",
-            "dark matter": "matière noire",
-            "dark energy": "énergie noire",
-            "gravitational wave": "onde gravitationnelle",
             # Mathematics
-            "theorem": "théorème",
-            "lemma": "lemme",
-            "corollary": "corollaire",
-            "proof": "démonstration",
-            "hypothesis": "hypothèse",
-            "conjecture": "conjecture",
-            "equation": "équation",
-            "inequality": "inégalité",
-            "matrix": "matrice",
-            "vector": "vecteur",
-            "tensor": "tenseur",
-            "eigenvalue": "valeur propre",
-            "eigenvector": "vecteur propre",
-            "differential equation": "équation différentielle",
-            "partial derivative": "dérivée partielle",
-            "integral": "intégrale",
-            "convergence": "convergence",
-            "optimization": "optimisation",
-            "convex function": "fonction convexe",
         }
         if direction == "fr-en":
             return {v: k for k, v in en_fr.items()}
@@ -987,41 +1125,8 @@ class SciTransGUI:
         """Biology and medical scientific terms."""
         en_fr = {
             # Biology
-            "protein": "protéine",
-            "amino acid": "acide aminé",
-            "nucleotide": "nucléotide",
-            "genome": "génome",
-            "gene expression": "expression génique",
-            "transcription": "transcription",
-            "translation": "traduction",
-            "mutation": "mutation",
-            "chromosome": "chromosome",
-            "cell membrane": "membrane cellulaire",
-            "mitochondria": "mitochondrie",
-            "enzyme": "enzyme",
-            "catalyst": "catalyseur",
-            "metabolism": "métabolisme",
-            "photosynthesis": "photosynthèse",
             # Structural Biology
-            "protein folding": "repliement des protéines",
-            "secondary structure": "structure secondaire",
-            "tertiary structure": "structure tertiaire",
-            "alpha helix": "hélice alpha",
-            "beta sheet": "feuillet bêta",
-            "binding site": "site de liaison",
-            "active site": "site actif",
             # Medical
-            "clinical trial": "essai clinique",
-            "diagnosis": "diagnostic",
-            "prognosis": "pronostic",
-            "treatment": "traitement",
-            "therapy": "thérapie",
-            "drug": "médicament",
-            "vaccine": "vaccin",
-            "antibody": "anticorps",
-            "antigen": "antigène",
-            "immune system": "système immunitaire",
-            "inflammation": "inflammation",
         }
         if direction == "fr-en":
             return {v: k for k, v in en_fr.items()}
@@ -1317,92 +1422,11 @@ class SciTransGUI:
         """Expanded Europarl terminology (500+ terms)."""
         en_fr = {
             # Institutions
-            "European Union": "Union européenne",
-            "European Parliament": "Parlement européen",
-            "European Commission": "Commission européenne",
-            "Council of Ministers": "Conseil des ministres",
-            "European Council": "Conseil européen",
-            "Court of Justice": "Cour de justice",
-            "European Central Bank": "Banque centrale européenne",
-            "European Investment Bank": "Banque européenne d'investissement",
-            "Committee of the Regions": "Comité des régions",
-            "Economic and Social Committee": "Comité économique et social",
             # Legal terms
-            "regulation": "règlement",
-            "directive": "directive",
-            "decision": "décision",
-            "recommendation": "recommandation",
-            "opinion": "avis",
-            "treaty": "traité",
-            "protocol": "protocole",
-            "annex": "annexe",
-            "preamble": "préambule",
-            "article": "article",
-            "paragraph": "paragraphe",
-            "subparagraph": "alinéa",
-            "amendment": "amendement",
-            "proposal": "proposition",
-            "resolution": "résolution",
-            "legislation": "législation",
-            "legal basis": "base juridique",
-            "implementation": "mise en œuvre",
-            "transposition": "transposition",
-            "enforcement": "application",
-            "compliance": "conformité",
-            "infringement": "infraction",
             # Political terms
-            "Member State": "État membre",
-            "third country": "pays tiers",
-            "accession": "adhésion",
-            "enlargement": "élargissement",
-            "integration": "intégration",
-            "subsidiarity": "subsidiarité",
-            "proportionality": "proportionnalité",
-            "codecision": "codécision",
-            "consultation": "consultation",
-            "cooperation": "coopération",
-            "qualified majority": "majorité qualifiée",
-            "unanimity": "unanimité",
-            "veto": "veto",
             # Rights and freedoms
-            "human rights": "droits de l'homme",
-            "fundamental rights": "droits fondamentaux",
-            "civil rights": "droits civiques",
-            "freedom of movement": "liberté de circulation",
-            "freedom of expression": "liberté d'expression",
-            "right to privacy": "droit à la vie privée",
-            "data protection": "protection des données",
-            "non-discrimination": "non-discrimination",
-            "equality": "égalité",
-            "solidarity": "solidarité",
             # Economic terms
-            "single market": "marché unique",
-            "internal market": "marché intérieur",
-            "customs union": "union douanière",
-            "free trade": "libre-échange",
-            "competition": "concurrence",
-            "state aid": "aide d'État",
-            "public procurement": "marchés publics",
-            "monetary policy": "politique monétaire",
-            "fiscal policy": "politique budgétaire",
-            "budget": "budget",
-            "expenditure": "dépenses",
-            "revenue": "recettes",
             # Policy areas
-            "agriculture": "agriculture",
-            "environment": "environnement",
-            "transport": "transport",
-            "energy": "énergie",
-            "research": "recherche",
-            "education": "éducation",
-            "employment": "emploi",
-            "social policy": "politique sociale",
-            "regional policy": "politique régionale",
-            "foreign policy": "politique étrangère",
-            "security": "sécurité",
-            "defense": "défense",
-            "justice": "justice",
-            "home affairs": "affaires intérieures",
         }
         if direction == "fr-en":
             return {v: k for k, v in en_fr.items()}
@@ -1412,113 +1436,9 @@ class SciTransGUI:
         """Expanded scientific glossary (500+ terms across all domains)."""
         en_fr = {
             # Advanced ML/AI
-            "generative adversarial network": "réseau antagoniste génératif",
-            "variational autoencoder": "auto-encodeur variationnel",
-            "long short-term memory": "mémoire à long et court terme",
-            "gated recurrent unit": "unité récurrente à porte",
-            "batch normalization": "normalisation par lots",
-            "layer normalization": "normalisation par couche",
-            "attention head": "tête d'attention",
-            "multi-head attention": "attention multi-têtes",
-            "positional encoding": "encodage positionnel",
-            "cross-entropy loss": "perte d'entropie croisée",
-            "focal loss": "perte focale",
-            "knowledge distillation": "distillation de connaissances",
-            "transfer learning": "apprentissage par transfert",
-            "few-shot learning": "apprentissage à quelques exemples",
-            "zero-shot learning": "apprentissage sans exemple",
-            "meta-learning": "méta-apprentissage",
-            "continual learning": "apprentissage continu",
-            "federated learning": "apprentissage fédéré",
-            "model pruning": "élagage de modèle",
-            "quantization": "quantification",
-            "neural architecture search": "recherche d'architecture neuronale",
-            "hyperparameter tuning": "ajustement des hyperparamètres",
-            "cross-validation": "validation croisée",
-            "early stopping": "arrêt précoce",
-            "weight decay": "décroissance des poids",
-            "momentum": "moment",
-            "adaptive learning rate": "taux d'apprentissage adaptatif",
             # Physics & Math advanced
-            "Hamiltonian": "hamiltonien",
-            "Lagrangian": "lagrangien",
-            "perturbation theory": "théorie des perturbations",
-            "renormalization": "renormalisation",
-            "gauge theory": "théorie de jauge",
-            "symmetry breaking": "brisure de symétrie",
-            "phase transition": "transition de phase",
-            "critical point": "point critique",
-            "order parameter": "paramètre d'ordre",
-            "correlation function": "fonction de corrélation",
-            "partition function": "fonction de partition",
-            "density matrix": "matrice densité",
-            "Hilbert space": "espace de Hilbert",
-            "Banach space": "espace de Banach",
-            "Fourier transform": "transformée de Fourier",
-            "Laplace transform": "transformée de Laplace",
-            "Green's function": "fonction de Green",
-            "boundary condition": "condition aux limites",
-            "initial condition": "condition initiale",
-            "eigenfunction": "fonction propre",
-            "spectral decomposition": "décomposition spectrale",
             # Biology advanced
-            "CRISPR": "CRISPR",
-            "gene editing": "édition génique",
-            "epigenetics": "épigénétique",
-            "methylation": "méthylation",
-            "histone": "histone",
-            "chromatin": "chromatine",
-            "telomere": "télomère",
-            "apoptosis": "apoptose",
-            "autophagy": "autophagie",
-            "signal transduction": "transduction du signal",
-            "receptor": "récepteur",
-            "ligand": "ligand",
-            "kinase": "kinase",
-            "phosphorylation": "phosphorylation",
-            "pathway": "voie métabolique",
-            "biomarker": "biomarqueur",
-            "proteomics": "protéomique",
-            "genomics": "génomique",
-            "transcriptomics": "transcriptomique",
-            "metabolomics": "métabolomique",
-            "bioinformatics": "bio-informatique",
-            "sequence alignment": "alignement de séquences",
-            "phylogenetic tree": "arbre phylogénétique",
             # More common scientific terms
-            "abstract": "résumé",
-            "introduction": "introduction",
-            "methodology": "méthodologie",
-            "results": "résultats",
-            "discussion": "discussion",
-            "conclusion": "conclusion",
-            "references": "références",
-            "acknowledgments": "remerciements",
-            "supplementary material": "matériel supplémentaire",
-            "figure": "figure",
-            "table": "tableau",
-            "equation": "équation",
-            "hypothesis": "hypothèse",
-            "experiment": "expérience",
-            "observation": "observation",
-            "measurement": "mesure",
-            "analysis": "analyse",
-            "simulation": "simulation",
-            "model": "modèle",
-            "algorithm": "algorithme",
-            "dataset": "jeu de données",
-            "benchmark": "référence",
-            "baseline": "ligne de base",
-            "state-of-the-art": "état de l'art",
-            "accuracy": "précision",
-            "precision": "précision",
-            "recall": "rappel",
-            "F1 score": "score F1",
-            "ROC curve": "courbe ROC",
-            "AUC": "AUC",
-            "confidence interval": "intervalle de confiance",
-            "p-value": "valeur p",
-            "statistical significance": "significativité statistique",
         }
         if direction == "fr-en":
             return {v: k for k, v in en_fr.items()}
@@ -1665,70 +1585,9 @@ class SciTransGUI:
         """IATE (Inter-Active Terminology for Europe) terms."""
         en_fr = {
             # Technical/IT
-            "software": "logiciel",
-            "hardware": "matériel",
-            "database": "base de données",
-            "interface": "interface",
-            "network": "réseau",
-            "protocol": "protocole",
-            "server": "serveur",
-            "client": "client",
-            "browser": "navigateur",
-            "firewall": "pare-feu",
-            "encryption": "chiffrement",
-            "authentication": "authentification",
-            "authorization": "autorisation",
-            "backup": "sauvegarde",
-            "download": "téléchargement",
-            "upload": "téléversement",
-            "bandwidth": "bande passante",
-            "latency": "latence",
-            "throughput": "débit",
             # Business
-            "stakeholder": "partie prenante",
-            "shareholder": "actionnaire",
-            "turnover": "chiffre d'affaires",
-            "profit margin": "marge bénéficiaire",
-            "return on investment": "retour sur investissement",
-            "due diligence": "diligence raisonnable",
-            "merger": "fusion",
-            "acquisition": "acquisition",
-            "subsidiary": "filiale",
-            "joint venture": "coentreprise",
-            "outsourcing": "externalisation",
-            "procurement": "approvisionnement",
-            "supply chain": "chaîne d'approvisionnement",
-            "logistics": "logistique",
-            "inventory": "inventaire",
-            "warehouse": "entrepôt",
             # Environment
-            "climate change": "changement climatique",
-            "global warming": "réchauffement climatique",
-            "greenhouse gas": "gaz à effet de serre",
-            "carbon footprint": "empreinte carbone",
-            "renewable energy": "énergie renouvelable",
-            "sustainable development": "développement durable",
-            "biodiversity": "biodiversité",
-            "ecosystem": "écosystème",
-            "pollution": "pollution",
-            "waste management": "gestion des déchets",
-            "recycling": "recyclage",
-            "emission": "émission",
             # Healthcare
-            "diagnosis": "diagnostic",
-            "treatment": "traitement",
-            "prognosis": "pronostic",
-            "symptom": "symptôme",
-            "side effect": "effet secondaire",
-            "clinical trial": "essai clinique",
-            "placebo": "placebo",
-            "dosage": "posologie",
-            "prescription": "ordonnance",
-            "vaccine": "vaccin",
-            "immunization": "vaccination",
-            "outbreak": "épidémie",
-            "pandemic": "pandémie",
-            "quarantine": "quarantaine",
         }
         if direction == "fr-en":
             return {v: k for k, v in en_fr.items()}
@@ -1895,11 +1754,27 @@ class SciTransGUI:
                     if initial_backend not in allowed_backends:
                         initial_backend = "free"
                     initial_model_opts = self._get_model_options_for_backend(initial_backend)
+                    # Ensure initial model value is always valid (never "default" for backends that don't support it)
+                    if initial_backend in ["ollama", "huggingface", "openai", "anthropic", "deepseek"]:
+                        # These backends don't support "default", so ensure we use a valid model
+                        if initial_model_opts["value"] == "default" or initial_model_opts["value"] not in initial_model_opts["choices"]:
+                            initial_model_opts["value"] = initial_model_opts["choices"][0] if initial_model_opts["choices"] else "default"
 
                     with gr.Row():
                         # Left: Controls (narrower)
                         with gr.Column(scale=2):
-                            pdf_upload = gr.File(label="Upload PDF", file_types=[".pdf"])
+                            # Input method tabs: Upload or URL
+                            with gr.Tabs():
+                                with gr.Tab("📁 Upload PDF"):
+                                    pdf_upload = gr.File(label="Upload PDF", file_types=[".pdf"])
+                                with gr.Tab("🔗 From URL"):
+                                    pdf_url = gr.Textbox(
+                                        label="PDF URL",
+                                        placeholder="Enter URL to PDF (e.g., https://arxiv.org/pdf/1234.5678.pdf)",
+                                        lines=1
+                                    )
+                                    url_load_btn = gr.Button("📥 Load PDF from URL", variant="primary")
+                                    url_status = gr.Markdown("", visible=False)
                             
                             with gr.Row():
                                 source_lang = gr.Dropdown(["en", "fr"], value="en", label="From", scale=1)
@@ -2028,28 +1903,22 @@ class SciTransGUI:
                                             lines=4, 
                                             interactive=False, 
                                             show_label=False,
-                                            placeholder="Status will appear here...",
-                                            max_lines=20,  # Make scrollable
-                                            scroll=True
+                                            placeholder="Status will appear here..."
                                         )
                                     with gr.Tab("Log"):
                                         log_box = gr.Textbox(
-                                            lines=6, 
+                                            lines=20, 
                                             interactive=False, 
                                             show_label=False, 
                                             autoscroll=True,
-                                            placeholder="Translation logs will appear here...",
-                                            max_lines=100,  # Make scrollable
-                                            scroll=True
+                                            placeholder="Translation logs will appear here..."
                                         )
                                     with gr.Tab("Performance"):
                                         perf_info = gr.Textbox(
                                             lines=4,
                                             interactive=False,
                                             show_label=False,
-                                            placeholder="Performance metrics will appear here...",
-                                            max_lines=20,  # Make scrollable
-                                            scroll=True
+                                            placeholder="Performance metrics will appear here..."
                                         )
                         
                         # Right: Preview (wider) - Preview replaces progress/status area
@@ -2086,9 +1955,7 @@ class SciTransGUI:
                                         lines=20,
                                         label="Translation Preview (Before Rendering)",
                                         interactive=False,
-                                        placeholder="Translation preview will appear here after translation completes...",
-                                        max_lines=200,  # Make scrollable for long previews
-                                        scroll=True
+                                        placeholder="Translation preview will appear here after translation completes..."
                                     )
                             
                             # Loading indicator (shown during translation)
@@ -2140,7 +2007,7 @@ See: https://arxiv.org/abs/1234.5678 for more details.""",
                                 label="Sample Text (includes headers, bullets, math, URLs)", lines=8
                             )
                             test_backend_btn = gr.Button("▶ Test Backend")
-                            test_backend_result = gr.Textbox(label="Result", lines=6, max_lines=50, scroll=True)
+                            test_backend_result = gr.Textbox(label="Result", lines=6)
                         
                         with gr.Column():
                             gr.Markdown("**🎭 Masking Test**")
@@ -2159,19 +2026,19 @@ References:
                                 label="Test Input (LaTeX, URLs, code, emails)", lines=8
                             )
                             test_masking_btn = gr.Button("▶ Test Masking")
-                            test_masking_result = gr.Textbox(label="Result", lines=6, max_lines=50, scroll=True)
+                            test_masking_result = gr.Textbox(label="Result", lines=6)
                     
                     with gr.Row():
                         with gr.Column():
                             gr.Markdown("**📄 Layout Test**\nTest font detection, headers, footers, structure.")
                             layout_pdf = gr.File(label="Upload PDF to analyze layout", file_types=[".pdf"])
                             test_layout_btn = gr.Button("▶ Test Layout")
-                            test_layout_result = gr.Textbox(label="Result", lines=6, max_lines=50, scroll=True)
+                            test_layout_result = gr.Textbox(label="Result", lines=15)
                         
                         with gr.Column():
                             gr.Markdown("**💾 Cache Test**\nVerify translation caching is working.")
                             test_cache_btn = gr.Button("▶ Test Cache")
-                            test_cache_result = gr.Textbox(label="Result", lines=6, max_lines=50, scroll=True)
+                            test_cache_result = gr.Textbox(label="Result", lines=6)
                     
                     # Additional test samples
                     with gr.Accordion("📝 More Test Samples", open=False):
@@ -2239,7 +2106,7 @@ Copy these to test different formatting:
                                 save_key_btn = gr.Button("💾 Save Key", variant="primary")
                                 delete_key_btn = gr.Button("🗑️ Delete Key", variant="stop")
                             
-                            api_status = gr.Textbox(label="Status", lines=2, interactive=False, max_lines=10, scroll=True)
+                            api_status = gr.Textbox(label="Status", lines=2, interactive=False)
                             
                             # Refresh button for API keys table
                             refresh_keys_btn = gr.Button("🔄 Refresh Keys Table", variant="secondary", size="sm")
@@ -2434,7 +2301,7 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                         
                         with gr.Column(scale=1):
                             gr.Markdown("**📖 Current Glossary**")
-                            term_count = gr.Textbox(value=f"{len(self.glossary)} terms loaded", label="", interactive=False, max_lines=1)
+                            term_count = gr.Textbox(value=f"{len(self.glossary)} terms loaded", label="", interactive=False)
                             glossary_preview = gr.Dataframe(
                                 headers=["Source Term", "Translation"],
                                 value=[[k, v] for k, v in list(self.glossary.items())[:50]] if self.glossary else [],
@@ -2531,26 +2398,52 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
             def on_upload(pdf):
                 self.translated_pdf_path = None
                 if pdf is None:
-                    return None, None, gr.update(maximum=1, value=1), "of 1"
-                # Return PDF file path directly for File component
+                    self.source_pdf_path = None
+                    return None, None, gr.update(maximum=1, value=1), "of 1", gr.update(visible=False, value="")
+                # Store source PDF path for preview
                 pdf_path = pdf.name if hasattr(pdf, 'name') else str(pdf)
+                self.source_pdf_path = pdf_path
                 count = self.get_page_count(pdf)
-                return pdf_path, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}"
+                # Return source PDF for source_preview, None for trans_preview (not translated yet)
+                return pdf_path, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}", gr.update(visible=False, value="")
             
-            pdf_upload.change(fn=on_upload, inputs=[pdf_upload], outputs=[source_preview, trans_preview, page_slider, page_total])
+            # URL download
+            def on_url_load(url):
+                if not url or not url.strip():
+                    self.source_pdf_path = None
+                    return None, None, gr.update(maximum=1, value=1), "of 1", gr.update(visible=True, value="❌ Please enter a URL")
+                
+                pdf_path, status_msg = self.download_pdf_from_url(url)
+                if pdf_path:
+                    # Store source PDF path
+                    self.source_pdf_path = pdf_path
+                    # Create a file-like object for Gradio
+                    count = self.get_page_count(type('obj', (object,), {'name': pdf_path})())
+                    # Return source PDF for source_preview, None for trans_preview
+                    return pdf_path, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}", gr.update(visible=True, value=status_msg)
+                else:
+                    self.source_pdf_path = None
+                    return None, None, gr.update(maximum=1, value=1), "of 1", gr.update(visible=True, value=status_msg)
+            
+            pdf_upload.change(fn=on_upload, inputs=[pdf_upload], outputs=[source_preview, trans_preview, page_slider, page_total, url_status])
+            url_load_btn.click(fn=on_url_load, inputs=[pdf_url], outputs=[source_preview, trans_preview, page_slider, page_total, url_status])
             
             # Unified page navigation for source and translated previews
-            # Note: With File components showing full PDFs, page navigation is handled by the PDF viewer
-            # Just return the file paths - user can navigate within the PDF viewer
+            # Update both source and translated previews independently based on page slider
             def nav_page(pdf, page, total, direction):
-                pdf_path = pdf.name if hasattr(pdf, 'name') else str(pdf) if pdf else None
-                doc_path = self.translated_pdf_path if getattr(self, "translated_pdf_path", None) else None
+                # Get source PDF path (from upload or stored)
+                source_path = self.source_pdf_path if self.source_pdf_path else (pdf.name if hasattr(pdf, 'name') else str(pdf) if pdf else None)
+                # Get translated PDF path (only available after translation)
+                trans_path = self.translated_pdf_path if getattr(self, "translated_pdf_path", None) else None
+                
                 try:
                     max_p = int(str(total).replace("of", "").strip())
                 except Exception:
                     max_p = 1
                 new_p = max(1, min(max_p, int(page) + direction))
-                return pdf_path, doc_path, new_p
+                
+                # Return source PDF for source_preview, translated PDF for trans_preview
+                return source_path, trans_path, new_p
             
             page_prev.click(
                 fn=lambda p, pg, t: nav_page(p, pg, t, -1),
@@ -2607,12 +2500,19 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
             
             def clear_all():
                 self.translated_pdf_path = None
+                self.source_pdf_path = None
                 return "", gr.update(value=None, visible=False), "", None, "of 1", gr.update(maximum=1, value=1), None, "", ""
             
             clear_btn.click(fn=clear_all, outputs=translate_outputs)
             
+            def update_backend_and_model(backend_value):
+                """Update model options when backend changes, ensuring valid value."""
+                opts = self._get_model_options_for_backend(backend_value)
+                # Always reset to first valid option to prevent invalid "default" values
+                return gr.update(choices=opts["choices"], value=opts["value"], visible=opts["visible"])
+            
             backend.change(
-                fn=self.update_model_options,
+                fn=update_backend_and_model,
                 inputs=[backend],
                 outputs=[model_selector]
             )

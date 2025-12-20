@@ -114,9 +114,9 @@ class FastTranslator:
     
     def __init__(
         self,
-        max_concurrent: int = 3,  # Reduced to avoid rate limits
+        max_concurrent: int = 5,  # Increased for better speed (was 3)
         cache_dir: str = ".cache/translations",
-        timeout: int = 20,  # Increased timeout
+        timeout: int = 30,  # Increased timeout for large PDFs
         retry_count: int = 2,
         rate_limit_delay: float = 0.5  # Delay between requests to avoid rate limits
     ):
@@ -332,55 +332,78 @@ class FastTranslator:
         results: List,
         total: int
     ):
-        """Translate jobs using async aiohttp with rate limiting."""
+        """Translate jobs using async aiohttp with rate limiting and shared session."""
         semaphore = asyncio.Semaphore(self.max_concurrent)
         
-        async def translate_one(job: TranslationJob):
-            async with semaphore:
-                # Rate limiting - only delay for actual API calls (not cached)
-                # Delay is minimal since caching handles most requests
-                if self.rate_limit_delay > 0:
-                    await asyncio.sleep(self.rate_limit_delay)
-                
-                for service_name, service_fn in self.services:
-                    for attempt in range(self.retry_count):
-                        try:
-                            # Hard timeout guard to prevent indefinite hangs
-                            result = await asyncio.wait_for(
-                                service_fn(
-                                    job.text,
-                                    job.source_lang,
-                                    job.target_lang
-                                ),
-                                timeout=self.timeout + 5  # small buffer over per-call timeout
-                            )
-                            if result:
-                                job.result = result
-                                results[job.index] = result
-                                self.stats["translated"] += 1
-                                if progress_callback:
-                                    completed = sum(1 for r in results if r is not None)
-                                    progress_callback(completed, total)
-                                return
-                        except Exception as e:
-                            error_msg = str(e)
-                            # Check if it's a rate limit error
-                            if "429" in error_msg or "Too Many Requests" in error_msg:
-                                self.stats["rate_limited"] += 1
-                                # Exponential backoff for rate limits
-                                wait_time = (attempt + 1) * 2
-                                logger.debug(f"Rate limited, waiting {wait_time}s before retry")
-                                await asyncio.sleep(wait_time)
-                                continue
-                            logger.debug(f"{service_name} attempt {attempt+1} failed: {e}")
-                            break  # Try next service
-                
-                # All services failed
-                job.error = "All translation services failed"
-                self.stats["errors"] += 1
+        # Create shared aiohttp session for all requests (connection pooling)
+        if HAS_AIOHTTP:
+            session = aiohttp.ClientSession()
+        else:
+            session = None
         
-        # Run all translations concurrently
-        await asyncio.gather(*[translate_one(job) for job in jobs])
+        try:
+            async def translate_one(job: TranslationJob):
+                async with semaphore:
+                    # Rate limiting - only delay for actual API calls (not cached)
+                    # Delay is minimal since caching handles most requests
+                    if self.rate_limit_delay > 0:
+                        await asyncio.sleep(self.rate_limit_delay)
+                    
+                    for service_name, service_fn in self.services:
+                        for attempt in range(self.retry_count):
+                            try:
+                                # Hard timeout guard to prevent indefinite hangs
+                                # Pass session to service functions that support it
+                                if service_name == "mymemory" and session:
+                                    result = await asyncio.wait_for(
+                                        self._translate_mymemory_with_session(
+                                            job.text,
+                                            job.source_lang,
+                                            job.target_lang,
+                                            session
+                                        ),
+                                        timeout=self.timeout + 5
+                                    )
+                                else:
+                                    result = await asyncio.wait_for(
+                                        service_fn(
+                                            job.text,
+                                            job.source_lang,
+                                            job.target_lang
+                                        ),
+                                        timeout=self.timeout + 5
+                                    )
+                                if result:
+                                    job.result = result
+                                    results[job.index] = result
+                                    self.stats["translated"] += 1
+                                    if progress_callback:
+                                        completed = sum(1 for r in results if r is not None)
+                                        progress_callback(completed, total)
+                                    return
+                            except Exception as e:
+                                error_msg = str(e)
+                                # Check if it's a rate limit error
+                                if "429" in error_msg or "Too Many Requests" in error_msg:
+                                    self.stats["rate_limited"] += 1
+                                    # Exponential backoff for rate limits
+                                    wait_time = (attempt + 1) * 2
+                                    logger.debug(f"Rate limited, waiting {wait_time}s before retry")
+                                    await asyncio.sleep(wait_time)
+                                    continue
+                                logger.debug(f"{service_name} attempt {attempt+1} failed: {e}")
+                                break  # Try next service
+                    
+                    # All services failed
+                    job.error = "All translation services failed"
+                    self.stats["errors"] += 1
+            
+            # Run all translations concurrently
+            await asyncio.gather(*[translate_one(job) for job in jobs])
+        finally:
+            # Clean up session
+            if session:
+                await session.close()
     
     def _translate_threaded(
         self,
@@ -445,7 +468,39 @@ class FastTranslator:
         return None
     
     async def _translate_mymemory(self, text: str, source: str, target: str) -> Optional[str]:
-        """Translate using MyMemory API (async)."""
+        """Translate using MyMemory API (async) - creates its own session."""
+        if HAS_AIOHTTP:
+            async with aiohttp.ClientSession() as session:
+                return await self._translate_mymemory_with_session(text, source, target, session)
+        else:
+            # Fallback to requests
+            import urllib.parse
+            import requests
+            
+            chunks = self._chunk_text(text, limit=450)
+            translated_chunks: List[str] = []
+            for chunk in chunks:
+                langpair = f"{source}|{target}"
+                encoded_text = urllib.parse.quote(chunk)
+                url = f"https://api.mymemory.translated.net/get?q={encoded_text}&langpair={langpair}"
+                try:
+                    resp = requests.get(url, timeout=self.timeout)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if data.get("responseStatus") == 200:
+                            translated = data.get("responseData", {}).get("translatedText")
+                            if translated and translated != chunk:
+                                translated_chunks.append(translated)
+                                continue
+                except Exception as e:
+                    logger.debug(f"MyMemory error: {e}")
+                translated_chunks.append(chunk)
+            
+            combined = " ".join(translated_chunks).strip()
+            return combined if combined else None
+    
+    async def _translate_mymemory_with_session(self, text: str, source: str, target: str, session) -> Optional[str]:
+        """Translate using MyMemory API with provided session (for connection pooling)."""
         import urllib.parse
 
         async def translate_chunk(chunk: str) -> Optional[str]:
@@ -453,20 +508,9 @@ class FastTranslator:
             encoded_text = urllib.parse.quote(chunk)
             url = f"https://api.mymemory.translated.net/get?q={encoded_text}&langpair={langpair}"
             try:
-                if HAS_AIOHTTP:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=self.timeout)) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if data.get("responseStatus") == 200:
-                                    translated = data.get("responseData", {}).get("translatedText")
-                                    if translated and translated != chunk:
-                                        return translated
-                else:
-                    import requests
-                    resp = requests.get(url, timeout=self.timeout)
-                    if resp.status_code == 200:
-                        data = resp.json()
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=self.timeout)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
                         if data.get("responseStatus") == 200:
                             translated = data.get("responseData", {}).get("translatedText")
                             if translated and translated != chunk:
@@ -485,15 +529,19 @@ class FastTranslator:
         return combined if combined else None
     
     async def _translate_google_free(self, text: str, source: str, target: str) -> Optional[str]:
-        """Translate using deep-translator's Google backend (sync fallback)."""
+        """Translate using deep-translator's Google backend (async wrapper to avoid blocking)."""
         try:
             from deep_translator import GoogleTranslator
 
             translator = GoogleTranslator(source=source, target=target)
 
+            # Run blocking calls in thread pool to avoid blocking event loop
+            loop = asyncio.get_event_loop()
             translated_chunks: List[str] = []
+            
             for chunk in self._chunk_text(text, limit=4500):
-                result = translator.translate(chunk)
+                # Use run_in_executor to run blocking translate call in thread pool
+                result = await loop.run_in_executor(None, translator.translate, chunk)
                 translated_chunks.append(result if result else chunk)
 
             combined = " ".join(translated_chunks).strip()

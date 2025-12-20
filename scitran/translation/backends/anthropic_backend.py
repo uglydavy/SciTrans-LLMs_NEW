@@ -2,6 +2,7 @@
 
 import os
 import time
+import asyncio
 from typing import Optional
 
 try:
@@ -55,7 +56,7 @@ class AnthropicBackend(TranslationBackend):
         return "\n\n".join(parts)
     
     async def translate(self, request: TranslationRequest) -> TranslationResponse:
-        """Translate asynchronously."""
+        """Translate asynchronously with concurrent requests for multiple candidates."""
         if not self.async_client:
             raise ValueError("Anthropic API key not configured")
         
@@ -65,10 +66,8 @@ class AnthropicBackend(TranslationBackend):
         user_prompt = self._build_prompt(request)
         
         try:
-            translations = []
-            tokens_used = 0
-            
-            for _ in range(request.num_candidates):
+            # Run multiple candidate requests concurrently
+            async def get_candidate():
                 response = await self.async_client.messages.create(
                     model=self.model,
                     max_tokens=4096,
@@ -76,9 +75,14 @@ class AnthropicBackend(TranslationBackend):
                     system=system,
                     messages=[{"role": "user", "content": user_prompt}]
                 )
-                
-                translations.append(response.content[0].text.strip())
-                tokens_used += response.usage.input_tokens + response.usage.output_tokens
+                return response
+            
+            # Gather all candidates concurrently
+            responses = await asyncio.gather(*[get_candidate() for _ in range(request.num_candidates)])
+            
+            translations = [resp.content[0].text.strip() for resp in responses]
+            finish_reasons = [resp.stop_reason for resp in responses]
+            tokens_used = sum(resp.usage.input_tokens + resp.usage.output_tokens for resp in responses)
             
             cost_per_1k = self.MODELS.get(self.model, {}).get("cost_per_1k", 0.003)
             cost = (tokens_used / 1000) * cost_per_1k
@@ -90,7 +94,11 @@ class AnthropicBackend(TranslationBackend):
                 model=self.model,
                 tokens_used=tokens_used,
                 cost=cost,
-                latency=latency
+                latency=latency,
+                finish_reasons=finish_reasons,
+                metadata={
+                    "stop_reasons": finish_reasons,
+                }
             )
             
         except Exception as e:

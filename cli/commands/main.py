@@ -39,6 +39,9 @@ def translate(
     font_files: Optional[str] = typer.Option(None, "--font-files", help="Comma-separated list of TTF/OTF font files to embed"),
     mask_custom_macros: bool = typer.Option(True, "--mask-custom-macros/--no-mask-custom-macros", help="Mask LaTeX custom macros (newcommand/DeclareMathOperator/etc.)"),
     mask_apostrophes_in_latex: bool = typer.Option(True, "--mask-apostrophes-in-latex/--no-mask-apostrophes-in-latex", help="Protect apostrophes inside math"),
+    fast_mode: bool = typer.Option(False, "--fast/--no-fast", help="Fast mode: optimize for speed (single candidate, no reranking)"),
+    overflow_strategy: str = typer.Option("shrink", "--overflow-strategy", help="PDF overflow handling: shrink/expand/append_pages/marker+append_pages"),
+    debug_mode: bool = typer.Option(False, "--debug/--no-debug", help="Enable debug logging"),
 ):
     """Translate a PDF document."""
     
@@ -79,18 +82,26 @@ def translate(
             
             # Configure pipeline
             config_task = progress.add_task("[cyan]Configuring pipeline...", total=1)
+            
+            # Load API key for the selected backend
+            api_key = _load_api_key_for_backend(backend)
+            
             config = PipelineConfig(
                 source_lang=source_lang,
                 target_lang=target_lang,
                 backend=backend,
                 model_name=model,  # Fixed: model -> model_name
+                api_key=api_key,  # Load API key from config/env
                 num_candidates=candidates,
                 enable_masking=enable_masking,
                 enable_reranking=enable_reranking,
                 quality_threshold=quality_threshold,
                 cache_translations=True,
                 mask_custom_macros=mask_custom_macros,
-                mask_apostrophes_in_latex=mask_apostrophes_in_latex
+                mask_apostrophes_in_latex=mask_apostrophes_in_latex,
+                fast_mode=fast_mode,  # PHASE 1.3
+                debug_mode=debug_mode,  # PHASE 4.1
+                debug_log_path=Path(".cache/scitrans/debug.jsonl") if debug_mode else None
             )
             
             # Setup progress callback
@@ -110,7 +121,8 @@ def translate(
             render_task = progress.add_task("[cyan]Rendering output...", total=1)
             renderer = PDFRenderer(
                 font_dir=str(font_dir) if font_dir else None,
-                font_files=[f.strip() for f in font_files.split(",")] if font_files else None
+                font_files=[f.strip() for f in font_files.split(",")] if font_files else None,
+                overflow_strategy=overflow_strategy  # PHASE 3.2
             )
             
             if output.suffix == ".pdf":
@@ -124,12 +136,12 @@ def translate(
             
             progress.update(render_task, completed=1, description=f"[green]✓ Output saved")
         
-        # Show statistics
+        # PHASE 4.2: Show comprehensive run summary
+        pipeline.print_run_summary(result)
+        
+        # Also show brief stats
         console.print("\n[bold green]Translation Complete![/bold green]")
-        console.print(f"Blocks translated: {result.blocks_translated}")
-        console.print(f"Time taken: {result.duration:.2f}s")
-        if result.bleu_score:
-            console.print(f"BLEU score: {result.bleu_score:.2f}")
+        console.print(f"Output: {output}")
         if result.glossary_adherence:
             console.print(f"Glossary adherence: {result.glossary_adherence:.0%}")
         
@@ -140,10 +152,16 @@ def translate(
 
 @app.command()
 def info(
-    input_file: Path = typer.Argument(..., help="PDF file to analyze")
+    input_file: Optional[Path] = typer.Argument(None, help="PDF file to analyze (optional, shows system info if omitted)")
 ):
-    """Show information about a PDF document."""
+    """Show system information or PDF document information."""
     
+    if input_file is None:
+        # Show system info
+        show_system_info()
+        return
+    
+    # Show PDF info
     if not input_file.exists():
         console.print(f"[red]Error: File not found: {input_file}[/red]")
         raise typer.Exit(1)
@@ -177,21 +195,53 @@ def backends(detailed: bool = typer.Option(False, "--detailed", "-d", help="Show
         OllamaBackend, FreeBackend, CascadeBackend, HuggingFaceBackend
     )
     
+    # Load API keys from config file
+    import os
+    from pathlib import Path
+    from scitran.utils.config_loader import load_config
+    
+    config_path = Path.home() / ".scitrans" / "config.yaml"
+    api_keys = {}
+    if config_path.exists():
+        try:
+            config = load_config(str(config_path))
+            api_keys = config.get("api_keys", {})
+        except:
+            pass
+    
+    # Also check environment variables (they take precedence)
+    env_mappings = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "huggingface": "HUGGINGFACE_API_KEY"
+    }
+    
     console.print("\n[bold]Available Translation Backends[/bold]\n")
     
     backends_list = [
-        ("cascade", CascadeBackend, "multi-service"),
-        ("free", FreeBackend, "google"),
-        ("huggingface", HuggingFaceBackend, "facebook/mbart-large-50-many-to-many-mmt"),
-        ("ollama", OllamaBackend, "llama3.1"),
-        ("deepseek", DeepSeekBackend, "deepseek-chat"),
-        ("openai", OpenAIBackend, "gpt-4o"),
-        ("anthropic", AnthropicBackend, "claude-3-5-sonnet-20241022")
+        ("cascade", CascadeBackend, "multi-service", None),
+        ("free", FreeBackend, "google", None),
+        ("huggingface", HuggingFaceBackend, "facebook/mbart-large-50-many-to-many-mmt", "huggingface"),
+        ("ollama", OllamaBackend, "llama3.1", None),
+        ("deepseek", DeepSeekBackend, "deepseek-chat", "deepseek"),
+        ("openai", OpenAIBackend, "gpt-4o", "openai"),
+        ("anthropic", AnthropicBackend, "claude-3-5-sonnet-20241022", "anthropic")
     ]
     
-    for name, backend_class, default_model in backends_list:
+    for name, backend_class, default_model, key_name in backends_list:
         try:
-            backend = backend_class(model=default_model)
+            # Get API key from environment (preferred) or config file
+            api_key = None
+            if key_name:
+                # Check environment variable first
+                if key_name in env_mappings:
+                    api_key = os.getenv(env_mappings[key_name])
+                # Fall back to config file
+                if not api_key and key_name in api_keys:
+                    api_key = api_keys[key_name]
+            
+            backend = backend_class(api_key=api_key, model=default_model)
             status = "✓ Available" if backend.is_available() else "✗ Not configured"
             color = "green" if backend.is_available() else "yellow"
             console.print(f"[{color}]{status}[/{color}] {name} ({default_model})")
@@ -359,6 +409,292 @@ def gui():
     except Exception as e:
         console.print(f"[red]Error launching GUI: {str(e)}[/red]")
         raise typer.Exit(1)
+
+
+def show_system_info():
+    """Show system information including API key status."""
+    import os
+    import sys
+    import platform
+    from pathlib import Path
+    from rich.table import Table
+    
+    console.print("\n[bold cyan]═══ SciTrans-LLMs System Information ═══[/bold cyan]\n")
+    
+    # System info
+    info_table = Table(show_header=False, box=None)
+    info_table.add_row("[bold]Python Version:[/bold]", f"{sys.version.split()[0]} ({sys.executable})")
+    info_table.add_row("[bold]Platform:[/bold]", f"{platform.system()} {platform.release()}")
+    info_table.add_row("[bold]Architecture:[/bold]", platform.machine())
+    console.print(info_table)
+    
+    # API Keys status
+    console.print("\n[bold]API Keys Status:[/bold]\n")
+    
+    from scitran.translation.backends import (
+        OpenAIBackend, AnthropicBackend, DeepSeekBackend,
+        OllamaBackend, FreeBackend, CascadeBackend, HuggingFaceBackend
+    )
+    
+    api_keys_table = Table(show_header=True, header_style="bold cyan")
+    api_keys_table.add_column("Backend", style="cyan")
+    api_keys_table.add_column("Status", style="green")
+    api_keys_table.add_column("Source", style="dim")
+    
+    backends_info = [
+        ("openai", OpenAIBackend, "OPENAI_API_KEY", "gpt-4o"),
+        ("anthropic", AnthropicBackend, "ANTHROPIC_API_KEY", "claude-3-5-sonnet-20241022"),
+        ("deepseek", DeepSeekBackend, "DEEPSEEK_API_KEY", "deepseek-chat"),
+        ("ollama", OllamaBackend, None, "llama3.1"),
+        ("free", FreeBackend, None, "google"),
+        ("cascade", CascadeBackend, None, "multi-service"),
+        ("huggingface", HuggingFaceBackend, "HUGGINGFACE_API_KEY", "facebook/mbart-large-50-many-to-many-mmt"),
+    ]
+    
+    # Check config file
+    config_path = Path.home() / ".scitrans" / "config.yaml"
+    config_keys = {}
+    if config_path.exists():
+        try:
+            from scitran.utils.config_loader import load_config
+            config = load_config(str(config_path))
+            config_keys = config.get("api_keys", {})
+        except:
+            pass
+    
+    for name, backend_class, env_var, model in backends_info:
+        try:
+            backend = backend_class(model=model)
+            is_available = backend.is_available()
+            
+            if is_available:
+                status = "✓ Configured"
+                status_style = "green"
+            else:
+                status = "✗ Not configured"
+                status_style = "yellow"
+            
+            # Determine source
+            source = "N/A (no key needed)"
+            if env_var:
+                env_value = os.getenv(env_var)
+                if env_value:
+                    source = f"Environment ({env_var})"
+                elif name in config_keys and config_keys[name]:
+                    source = f"Config file (~/.scitrans/config.yaml)"
+                else:
+                    source = "Not set"
+            
+            api_keys_table.add_row(name, f"[{status_style}]{status}[/{status_style}]", source)
+        except Exception as e:
+            api_keys_table.add_row(name, f"[red]Error[/red]", str(e)[:50])
+    
+    console.print(api_keys_table)
+    
+    # Configuration paths
+    console.print("\n[bold]Configuration:[/bold]\n")
+    config_table = Table(show_header=False, box=None)
+    config_table.add_row("[bold]Config file:[/bold]", str(config_path))
+    config_table.add_row("[bold]Cache directory:[/bold]", str(Path.home() / ".scitrans" / "cache"))
+    console.print(config_table)
+    
+    console.print("\n[dim]💡 Use 'scitrans keys set <backend> <key>' to set API keys[/dim]")
+    console.print("[dim]💡 Or set environment variables: OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.[/dim]\n")
+
+
+@app.command()
+def keys(
+    action: str = typer.Argument(..., help="Action: list, set, delete, check"),
+    backend: Optional[str] = typer.Option(None, "--backend", "-b", help="Backend name (for set/delete)"),
+    key: Optional[str] = typer.Option(None, "--key", "-k", help="API key value (for set)")
+):
+    """Manage API keys for translation backends."""
+    import os
+    from pathlib import Path
+    from scitran.utils.config_loader import load_config, save_config
+    
+    config_path = Path.home() / ".scitrans" / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load existing config or create default
+    if config_path.exists():
+        try:
+            config = load_config(str(config_path))
+        except:
+            from scitran.utils.config_loader import get_default_config
+            config = get_default_config()
+    else:
+        from scitran.utils.config_loader import get_default_config
+        config = get_default_config()
+    
+    if "api_keys" not in config:
+        config["api_keys"] = {}
+    
+    env_mappings = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "huggingface": "HUGGINGFACE_API_KEY"
+    }
+    
+    if action == "list":
+        console.print("\n[bold]Configured API Keys:[/bold]\n")
+        from rich.table import Table
+        keys_table = Table(show_header=True, header_style="bold cyan")
+        keys_table.add_column("Backend", style="cyan")
+        keys_table.add_column("Status", style="green")
+        keys_table.add_column("Source", style="dim")
+        
+        for backend_name, env_var in env_mappings.items():
+            env_value = os.getenv(env_var)
+            config_value = config.get("api_keys", {}).get(backend_name, "")
+            
+            if env_value:
+                status = "✓ Set (env)"
+                source = f"Environment: {env_var}"
+                masked_key = f"{env_value[:8]}...{env_value[-4:]}" if len(env_value) > 12 else "***"
+            elif config_value:
+                status = "✓ Set (config)"
+                source = "Config file"
+                masked_key = f"{config_value[:8]}...{config_value[-4:]}" if len(config_value) > 12 else "***"
+            else:
+                status = "✗ Not set"
+                source = "Not configured"
+                masked_key = ""
+            
+            keys_table.add_row(backend_name, status, source)
+            if masked_key:
+                keys_table.add_row("", f"  Key: {masked_key}", "")
+        
+        console.print(keys_table)
+        console.print(f"\n[dim]Config file: {config_path}[/dim]\n")
+    
+    elif action == "set":
+        if not backend:
+            console.print("[red]Error: --backend is required for 'set' action[/red]")
+            console.print("Usage: scitrans keys set --backend <name> --key <api_key>")
+            raise typer.Exit(1)
+        
+        if not key:
+            console.print("[red]Error: --key is required for 'set' action[/red]")
+            console.print("Usage: scitrans keys set --backend <name> --key <api_key>")
+            raise typer.Exit(1)
+        
+        if backend not in env_mappings:
+            console.print(f"[yellow]Warning: {backend} is not a known backend that requires API keys[/yellow]")
+            console.print(f"Known backends: {', '.join(env_mappings.keys())}")
+        
+        # Save to config
+        config["api_keys"][backend] = key.strip()
+        save_config(config, str(config_path))
+        
+        # Also set environment variable for current session
+        if backend in env_mappings:
+            os.environ[env_mappings[backend]] = key.strip()
+        
+        masked_key = f"{key[:8]}...{key[-4:]}" if len(key) > 12 else "***"
+        console.print(f"[green]✓ API key saved for {backend}[/green]")
+        console.print(f"  Key: {masked_key}")
+        console.print(f"  Saved to: {config_path}")
+        if backend in env_mappings:
+            console.print(f"  Environment variable {env_mappings[backend]} set for current session")
+    
+    elif action == "delete":
+        if not backend:
+            console.print("[red]Error: --backend is required for 'delete' action[/red]")
+            console.print("Usage: scitrans keys delete --backend <name>")
+            raise typer.Exit(1)
+        
+        if backend in config.get("api_keys", {}):
+            del config["api_keys"][backend]
+            save_config(config, str(config_path))
+            console.print(f"[green]✓ API key deleted for {backend}[/green]")
+        else:
+            console.print(f"[yellow]No API key found for {backend} in config file[/yellow]")
+        
+        # Also unset environment variable
+        if backend in env_mappings:
+            if env_mappings[backend] in os.environ:
+                del os.environ[env_mappings[backend]]
+                console.print(f"  Environment variable {env_mappings[backend]} unset")
+    
+    elif action == "check":
+        console.print("\n[bold]Checking API Key Availability:[/bold]\n")
+        
+        from scitran.translation.backends import (
+            OpenAIBackend, AnthropicBackend, DeepSeekBackend,
+            OllamaBackend, FreeBackend, CascadeBackend, HuggingFaceBackend
+        )
+        
+        backend_map = {
+            "openai": (OpenAIBackend, "gpt-4o"),
+            "anthropic": (AnthropicBackend, "claude-3-5-sonnet-20241022"),
+            "deepseek": (DeepSeekBackend, "deepseek-chat"),
+            "ollama": (OllamaBackend, "llama3.1"),
+            "free": (FreeBackend, "google"),
+            "cascade": (CascadeBackend, "multi-service"),
+            "huggingface": (HuggingFaceBackend, "facebook/mbart-large-50-many-to-many-mmt"),
+        }
+        
+        for name, (backend_class, model) in backend_map.items():
+            try:
+                backend = backend_class(model=model)
+                is_available = backend.is_available()
+                status = "✓ Available" if is_available else "✗ Not configured"
+                color = "green" if is_available else "yellow"
+                console.print(f"[{color}]{status}[/{color}] {name}")
+            except Exception as e:
+                console.print(f"[red]✗ Error[/red] {name}: {str(e)}")
+        
+        console.print()
+    
+    else:
+        console.print(f"[red]Unknown action: {action}[/red]")
+        console.print("Valid actions: list, set, delete, check")
+        raise typer.Exit(1)
+
+
+def _load_api_key_for_backend(backend: str) -> Optional[str]:
+    """Load API key for a backend from environment or config file.
+    
+    Args:
+        backend: Backend name
+        
+    Returns:
+        API key if found, None otherwise
+    """
+    import os
+    from pathlib import Path
+    
+    # Environment variable mappings
+    env_mappings = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "huggingface": "HUGGINGFACE_API_KEY"
+    }
+    
+    backend_lower = backend.lower()
+    
+    # Check environment variable first
+    if backend_lower in env_mappings:
+        api_key = os.getenv(env_mappings[backend_lower])
+        if api_key:
+            return api_key
+    
+    # Check config file
+    config_path = Path.home() / ".scitrans" / "config.yaml"
+    if config_path.exists():
+        try:
+            from scitran.utils.config_loader import load_config
+            config = load_config(str(config_path))
+            api_keys = config.get("api_keys", {})
+            if backend_lower in api_keys:
+                return api_keys[backend_lower]
+        except Exception:
+            pass
+    
+    return None
 
 
 def cli():

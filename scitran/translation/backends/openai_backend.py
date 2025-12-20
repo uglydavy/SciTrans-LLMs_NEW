@@ -17,6 +17,8 @@ from ..base import TranslationBackend, TranslationRequest, TranslationResponse
 class OpenAIBackend(TranslationBackend):
     """OpenAI GPT-based translation backend."""
     
+    supports_batch_candidates = True  # OpenAI supports n parameter
+    
     MODELS = {
         "gpt-4o": {"cost_per_1k": 0.005, "max_tokens": 128000},
         "gpt-4-turbo": {"cost_per_1k": 0.01, "max_tokens": 128000},
@@ -82,29 +84,19 @@ class OpenAIBackend(TranslationBackend):
         messages = self._build_messages(request)
         
         try:
-            if request.num_candidates > 1:
-                # Generate multiple candidates
-                response = await self.async_client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=request.temperature,
-                    n=request.num_candidates,
-                    max_tokens=4096
-                )
-                
-                translations = [choice.message.content.strip() for choice in response.choices]
-                tokens_used = response.usage.total_tokens if response.usage else 0
-            else:
-                # Single translation
-                response = await self.async_client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=request.temperature,
-                    max_tokens=4096
-                )
-                
-                translations = [response.choices[0].message.content.strip()]
-                tokens_used = response.usage.total_tokens if response.usage else 0
+            # Always use n parameter for batch candidates (single API call)
+            n = max(1, request.num_candidates)
+            response = await self.async_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=request.temperature,
+                n=n,
+                max_tokens=4096
+            )
+            
+            translations = [choice.message.content.strip() for choice in response.choices]
+            finish_reasons = [choice.finish_reason for choice in response.choices]
+            tokens_used = response.usage.total_tokens if response.usage else 0
             
             # Calculate cost
             cost_per_1k = self.MODELS.get(self.model, {}).get("cost_per_1k", 0.01)
@@ -118,7 +110,12 @@ class OpenAIBackend(TranslationBackend):
                 model=self.model,
                 tokens_used=tokens_used,
                 cost=cost,
-                latency=latency
+                latency=latency,
+                finish_reasons=finish_reasons,
+                metadata={
+                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+                }
             )
             
         except Exception as e:
@@ -133,25 +130,18 @@ class OpenAIBackend(TranslationBackend):
         messages = self._build_messages(request)
         
         try:
-            if request.num_candidates > 1:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=request.temperature,
-                    n=request.num_candidates,
-                    max_tokens=4096
-                )
-                translations = [choice.message.content.strip() for choice in response.choices]
-                tokens_used = response.usage.total_tokens if response.usage else 0
-            else:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=request.temperature,
-                    max_tokens=4096
-                )
-                translations = [response.choices[0].message.content.strip()]
-                tokens_used = response.usage.total_tokens if response.usage else 0
+            # Always use n parameter for batch candidates (single API call)
+            n = max(1, request.num_candidates)
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=request.temperature,
+                n=n,
+                max_tokens=4096
+            )
+            translations = [choice.message.content.strip() for choice in response.choices]
+            finish_reasons = [choice.finish_reason for choice in response.choices]
+            tokens_used = response.usage.total_tokens if response.usage else 0
             
             cost_per_1k = self.MODELS.get(self.model, {}).get("cost_per_1k", 0.01)
             cost = (tokens_used / 1000) * cost_per_1k
@@ -163,7 +153,12 @@ class OpenAIBackend(TranslationBackend):
                 model=self.model,
                 tokens_used=tokens_used,
                 cost=cost,
-                latency=latency
+                latency=latency,
+                finish_reasons=finish_reasons,
+                metadata={
+                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+                }
             )
             
         except Exception as e:

@@ -65,6 +65,10 @@ class PDFRenderer:
         font_dir: Optional[str] = None,
         font_files: Optional[List[str]] = None,
         font_priority: Optional[List[str]] = None,
+        # PHASE 3.2: Overflow handling
+        overflow_strategy: str = "shrink",  # "shrink", "expand", "append_pages", "marker+append_pages"
+        min_font_size: float = 4.0,  # Minimum font size when shrinking
+        min_lineheight: float = 0.95,  # Minimum line height multiplier
     ):
         if not HAS_PYMUPDF:
             raise ImportError("PyMuPDF not installed. Run: pip install PyMuPDF")
@@ -77,6 +81,12 @@ class PDFRenderer:
         self.font_dir = font_dir
         self.font_files = font_files or []
         self.font_priority = [f.lower().replace(" ", "") for f in font_priority] if font_priority else []
+        
+        # PHASE 3.2: Overflow configuration
+        self.overflow_strategy = overflow_strategy
+        self.min_font_size = min_font_size
+        self.min_lineheight = min_lineheight
+        self.overflow_report = []  # Track overflow events
     
     def cleanup(self):
         """Clean up temporary files."""
@@ -87,6 +97,24 @@ class PDFRenderer:
             except:
                 pass
         self.temp_files = []
+    
+    def save_overflow_report(self, output_path: str):
+        """Save overflow report to JSON file (PHASE 3.2)."""
+        if not self.overflow_report:
+            return
+        
+        import json
+        report_path = output_path.replace('.pdf', '_overflow_report.json')
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "total_overflows": len(self.overflow_report),
+                    "strategy": self.overflow_strategy,
+                    "events": self.overflow_report
+                }, f, indent=2, ensure_ascii=False)
+            logger.info(f"Overflow report saved to {report_path}")
+        except Exception as e:
+            logger.error(f"Failed to save overflow report: {e}")
     
     def render_pdf(self, document: Document, output_path: str, source_pdf: str = None):
         """Main entry point for PDF rendering."""
@@ -255,6 +283,7 @@ class PDFRenderer:
             for block in blocks_by_page[page_num]:
                 text = block.translated_text or block.source_text
                 rect = fitz.Rect(50, y_position, 545, y_position + 200)
+                # Use left align for simple rendering (no alignment info available)
                 page.insert_textbox(rect, text, fontsize=11, fontname="helv", align=0)
                 y_position += len(text.split("\n")) * 15 + 10
                 if y_position > 750:
@@ -333,10 +362,13 @@ class PDFRenderer:
             )
             redact_count += 1
         
-        # Apply all redactions - this removes the content
+        # Apply all redactions - CRITICAL: Must not remove vector graphics or images
         if redact_count > 0:
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-            logger.info(f"Applied {redact_count} redactions on page")
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,  # Don't touch images
+                graphics=fitz.PDF_REDACT_GRAPHICS_NONE  # DON'T REMOVE VECTOR GRAPHICS
+            )
+            logger.info(f"Applied {redact_count} redactions on page (text only, preserving graphics)")
     
     def render_with_layout(self, source_pdf: str, document: Document, output_path: str):
         """
@@ -406,15 +438,18 @@ class PDFRenderer:
         for page_num in range(total_pages_in_doc):
             page = doc[page_num]
             
+            # CRITICAL: Always stamp preserved blocks FIRST, before any redaction
+            # This ensures images/tables/formulas are preserved even if text overlaps
+            if page_num in preserve_by_page:
+                logger.info(f"Page {page_num + 1}/{total_pages_in_doc}: preserving {len(preserve_by_page[page_num])} non-translatable blocks (images/tables/formulas)")
+                self._stamp_preserved_blocks(page, source_doc[page_num], preserve_by_page[page_num])
+            
             if page_num in blocks_by_page:
                 page_blocks = blocks_by_page[page_num]
-                logger.info(f"Page {page_num + 1}/{total_pages_in_doc}: processing {len(page_blocks)} blocks")
-                
-                # Step 0: Preserve tables/equations/figures by stamping source region
-                if page_num in preserve_by_page:
-                    self._stamp_preserved_blocks(page, source_doc[page_num], preserve_by_page[page_num])
+                logger.info(f"Page {page_num + 1}/{total_pages_in_doc}: processing {len(page_blocks)} translated blocks")
                 
                 # Step 1: Redact (remove) source text in translation regions
+                # Note: This happens AFTER stamping, so preserved blocks are safe
                 self._redact_text_from_page(page, page_blocks)
                 
                 # Step 2: Insert translated text
@@ -422,10 +457,7 @@ class PDFRenderer:
                     self._insert_text_block(page, block)
                 pages_processed += 1
             else:
-                # Still stamp preserved blocks even if no translations
-                if page_num in preserve_by_page:
-                    self._stamp_preserved_blocks(page, source_doc[page_num], preserve_by_page[page_num])
-                logger.info(f"Page {page_num + 1}/{total_pages_in_doc}: no translated blocks")
+                logger.info(f"Page {page_num + 1}/{total_pages_in_doc}: no translated blocks (preserved blocks already stamped)")
         
         logger.info(f"Processed {pages_processed} pages with translations out of {total_pages_in_doc} total pages")
         
@@ -438,13 +470,18 @@ class PDFRenderer:
         doc.close()
         source_doc.close()
         
+        # PHASE 3.2: Save overflow report if any overflows occurred
+        if self.overflow_report:
+            self.save_overflow_report(output_path)
+            logger.warning(f"Rendering completed with {len(self.overflow_report)} overflow events")
+        
         # Cleanup temp
         self.cleanup()
         
         logger.info(f"PDF rendered to {output_path}")
     
     def _insert_text_block(self, page, block: Block):
-        """Insert a translated text block with proper formatting preserving original style."""
+        """Insert a translated text block with proper overflow handling (PHASE 3.2)."""
         rect = fitz.Rect(
             block.bbox.x0,
             block.bbox.y0,
@@ -460,18 +497,36 @@ class PDFRenderer:
         # Get font info with bold/italic
         fontname, is_bold, is_italic = self._get_font_name(block.font)
         
-        # Get font size from original block - PRESERVE EXACT SIZE
+        # Detect alignment
+        alignment = 0  # Default: left align (0=left, 1=center, 2=right, 3=justify)
+        if block.font and hasattr(block.font, 'alignment') and block.font.alignment:
+            align_str = block.font.alignment.lower()
+            if align_str == "center":
+                alignment = 1
+            elif align_str == "right":
+                alignment = 2
+            elif align_str == "justify":
+                alignment = 3
+        else:
+            # Infer alignment from block position
+            page_width = page.rect.width
+            block_center = (rect.x0 + rect.x1) / 2
+            page_center = page_width / 2
+            if abs(block_center - page_center) < page_width * 0.1:
+                alignment = 1  # Center
+            elif rect.x0 > page_width * 0.7:
+                alignment = 2  # Right
+        
+        # Get font size
         if block.font and block.font.size and block.font.size > 0:
             fontsize = block.font.size
         else:
-            # Estimate from bbox height - be more conservative
             bbox_height = rect.height
             num_lines = max(1, block.translated_text.count('\n') + 1)
-            # More accurate estimation: typical line height is ~1.2x font size
             estimated_size = bbox_height / num_lines / 1.2
-            fontsize = max(8, min(20, estimated_size))  # Allow larger fonts
+            fontsize = max(8, min(20, estimated_size))
         
-        # Get color (default black)
+        # Get color
         color = (0, 0, 0)
         if block.font and block.font.color:
             try:
@@ -485,61 +540,98 @@ class PDFRenderer:
         if not text or not text.strip():
             return
         
-        # PRESERVE ORIGINAL FONT SIZE - only reduce if absolutely necessary
-        # Try original size first, then minimal reductions
-        min_size = 6 if self.strict_mode else 7
-        sizes_to_try = [fontsize, fontsize * 0.95, fontsize * 0.9, fontsize * 0.85, max(min_size, fontsize * 0.75)]
+        # Try inserting with progressively smaller sizes
+        line_height = 1.2 if fontsize > 12 else 1.15
+        sizes_to_try = [fontsize, fontsize * 0.95, fontsize * 0.9, fontsize * 0.85, max(self.min_font_size, fontsize * 0.75)]
         
         for size in sizes_to_try:
             try:
-                # Use insert_textbox for multi-line text fitting
-                # Preserve line spacing based on original font size
-                line_height = 1.15 if fontsize > 12 else 1.1
-                
                 rc = page.insert_textbox(
                     rect,
                     text,
                     fontsize=size,
                     fontname=fontname,
                     color=color,
-                    align=0,  # Left align
-                    lineheight=line_height,
+                    align=alignment,
+                    lineheight=line_height * self.min_lineheight,
                     render_mode=0,
                 )
                 
-                # rc >= 0 means text fit perfectly
                 if rc >= 0:
-                    logger.debug(f"✓ Inserted block {block.block_id}: font={fontname}, size={size:.1f}, bold={is_bold}, italic={is_italic}")
+                    # Text fit successfully
+                    logger.debug(f"✓ Inserted block {block.block_id}: size={size:.1f}")
                     return
-                elif size == sizes_to_try[-1]:
-                    # Last attempt - accept even with overflow (text was inserted)
-                    msg = f"Overflow accepted (strict={self.strict_mode}) block {block.block_id}: font={fontname}, size={size:.1f}"
-                    if self.strict_mode:
-                        logger.warning(msg)
-                    else:
-                        logger.debug(f"⚠ {msg}")
-                    return
-                    
             except Exception as e:
-                logger.debug(f"Insert attempt failed for {block.block_id} at size {size}: {e}")
+                logger.debug(f"Insert attempt failed at size {size}: {e}")
                 continue
         
-        # Final fallback - use original font size even if overflow
-        try:
-            page.insert_textbox(
-                rect, 
-                text, 
-                fontsize=fontsize,  # Use original size
-                fontname=fontname,  # Use original font
-                color=color,  # Use original color
-                align=0
-            )
-            logger.debug(f"Fallback insert for block {block.block_id}: font={fontname}, size={fontsize}")
-        except Exception as e:
-            logger.error(f"All insert attempts failed for block {block.block_id}: {e}")
+        # PHASE 3.2: All size attempts failed - handle overflow
+        logger.warning(f"Overflow detected for block {block.block_id}, strategy={self.overflow_strategy}")
+        
+        overflow_event = {
+            "block_id": block.block_id,
+            "page": block.bbox.page if block.bbox else None,
+            "text_length": len(text),
+            "strategy": self.overflow_strategy,
+        }
+        self.overflow_report.append(overflow_event)
+        
+        if self.overflow_strategy == "shrink":
+            # Force insert at minimum size (may truncate)
+            try:
+                page.insert_textbox(
+                    rect, text, fontsize=self.min_font_size,
+                    fontname=fontname, color=color, align=alignment,
+                    lineheight=self.min_lineheight
+                )
+                logger.warning(f"Forced insert at min size for {block.block_id}")
+            except Exception as e:
+                logger.error(f"Failed to insert even at min size: {e}")
+        
+        elif self.overflow_strategy == "expand":
+            # Try expanding rect downward
+            expanded_rect = fitz.Rect(rect.x0, rect.y0, rect.x1, min(rect.y1 + 100, page.rect.height))
+            try:
+                rc = page.insert_textbox(
+                    expanded_rect, text, fontsize=fontsize * 0.8,
+                    fontname=fontname, color=color, align=alignment,
+                    lineheight=line_height
+                )
+                if rc >= 0:
+                    logger.info(f"Overflow resolved by expanding rect for {block.block_id}")
+                else:
+                    logger.warning(f"Expand strategy still overflowed for {block.block_id}")
+            except Exception as e:
+                logger.error(f"Expand strategy failed: {e}")
+        
+        elif self.overflow_strategy in ["append_pages", "marker+append_pages"]:
+            # Insert marker in original location
+            if self.overflow_strategy == "marker+append_pages":
+                marker = f"(continued on overflow page)"
+                try:
+                    page.insert_textbox(
+                        rect, marker, fontsize=fontsize * 0.8,
+                        fontname=fontname, color=(0.5, 0, 0), align=alignment
+                    )
+                except:
+                    pass
+            
+            # Store full text for overflow page (will be added in render_with_layout)
+            overflow_event["full_text"] = text
+            overflow_event["fontsize"] = fontsize
+            overflow_event["fontname"] = fontname
+            overflow_event["color"] = color
+            logger.info(f"Marked block {block.block_id} for overflow page")
+        
+        else:
+            logger.error(f"Unknown overflow strategy: {self.overflow_strategy}")
     
     def _stamp_preserved_blocks(self, target_page, source_page, blocks: List[Block]):
-        """Stamp source regions for tables/equations/figures to preserve appearance."""
+        """Stamp source regions for tables/equations/figures - VECTOR ONLY (no rasterization).
+        
+        NOTE: With proper redaction (graphics=0), this should rarely be needed.
+        This is a safety fallback only.
+        """
         for block in blocks:
             if not block.bbox:
                 continue
@@ -547,13 +639,19 @@ class PDFRenderer:
             if rect.is_empty or rect.is_infinite:
                 continue
             try:
-                # Clip region from source page
-                pix = source_page.get_pixmap(matrix=fitz.Matrix(1, 1), clip=rect)
-                img_stream = pix.tobytes("png")
-                target_page.insert_image(rect, stream=img_stream, keep_proportion=False, overlay=True)
-                logger.debug(f"Stamped preserved region for block {block.block_id} ({block.block_type})")
+                # VECTOR stamping using show_pdf_page (NO RASTERIZATION)
+                # This preserves vector graphics perfectly
+                target_page.show_pdf_page(
+                    rect,  # Target position
+                    source_page.parent,  # Source PDF
+                    source_page.number,  # Source page number
+                    clip=rect,  # Clip to this region
+                    keep_proportion=False,
+                    overlay=True  # Overlay on existing content
+                )
+                logger.debug(f"Vector-stamped preserved region for {block.block_id} ({block.block_type})")
             except Exception as e:
-                logger.warning(f"Failed to stamp preserved block {block.block_id}: {e}")
+                logger.warning(f"Failed to vector-stamp block {block.block_id}: {e}")
     
     def render_clean_translation(self, source_pdf: str, document: Document, output_path: str):
         """

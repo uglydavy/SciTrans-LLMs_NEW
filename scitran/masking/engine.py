@@ -41,9 +41,16 @@ class MaskingConfig:
     mask_apostrophes_in_latex: bool = True  # Treat apostrophes inside math as part of math
     mask_custom_macros: bool = True  # Broader macro handling
     
+    # Placeholder style (backend-aware)
+    placeholder_style: str = "angle"  # "angle" (<<TYPE_0001>>) or "alnum" (SCITRANS_TYPE_0001_SCITRANS)
+    placeholder_prefix: str = "SCITRANS"  # Prefix for alnum style
+    placeholder_suffix: str = "SCITRANS"  # Suffix for alnum style
+    placeholder_case: str = "upper"  # "upper" or "lower"
+    
     # Validation settings
     strict_validation: bool = True  # Fail if masks can't be restored
     log_validation_errors: bool = True
+    tolerant_unmasking: bool = True  # Try variant matching if exact match fails
     
     # Performance settings
     use_cache: bool = True
@@ -338,9 +345,58 @@ class MaskingEngine:
         
         return block
     
+    def find_placeholder_variants(self, placeholder: str) -> List[str]:
+        """Generate regex patterns for tolerant placeholder matching.
+        
+        Args:
+            placeholder: Original placeholder (e.g., "<<MATH_0001>>")
+        
+        Returns:
+            List of regex patterns that match common mutations
+        """
+        patterns = []
+        
+        # Extract parts from placeholder
+        if placeholder.startswith("<<") and placeholder.endswith(">>"):
+            # Angle style: <<TYPE_0001>>
+            inner = placeholder[2:-2]  # TYPE_0001
+            parts = inner.split("_")
+            if len(parts) >= 2:
+                mask_type, mask_id = parts[0], parts[1]
+                
+                # Pattern 1: Exact match
+                patterns.append(re.escape(placeholder))
+                
+                # Pattern 2: With arbitrary spaces
+                patterns.append(r"<<\s*" + re.escape(mask_type) + r"\s*_\s*" + re.escape(mask_id) + r"\s*>>")
+                
+                # Pattern 3: Guillemets variants
+                patterns.append(r"«\s*" + re.escape(mask_type) + r"\s*_\s*" + re.escape(mask_id) + r"\s*»")
+                patterns.append(r"‹\s*" + re.escape(mask_type) + r"\s*_\s*" + re.escape(mask_id) + r"\s*›")
+                
+                # Pattern 4: Case-insensitive
+                patterns.append(r"<<\s*" + mask_type + r"\s*_\s*" + mask_id + r"\s*>>")
+                
+        elif self.config.placeholder_prefix in placeholder and self.config.placeholder_suffix in placeholder:
+            # Alnum style: SCITRANS_TYPE_0001_SCITRANS
+            parts = placeholder.split("_")
+            if len(parts) >= 4:
+                prefix, mask_type, mask_id, suffix = parts[0], parts[1], parts[2], parts[3]
+                
+                # Pattern 1: Exact
+                patterns.append(re.escape(placeholder))
+                
+                # Pattern 2: With spaces
+                patterns.append(re.escape(prefix) + r"\s*_\s*" + re.escape(mask_type) + r"\s*_\s*" + re.escape(mask_id) + r"\s*_\s*" + re.escape(suffix))
+                
+                # Pattern 3: Case variants
+                patterns.append(prefix + r"_" + mask_type + r"_" + mask_id + r"_" + suffix)
+        
+        return patterns
+    
     def unmask_block(self, block: Block, validate: bool = True) -> Block:
         """
-        Restore masked content in a block.
+        Restore masked content in a block with tolerant matching.
         
         Args:
             block: Block with translated_text to unmask
@@ -360,11 +416,41 @@ class MaskingEngine:
         sorted_masks = sorted(block.masks, key=lambda m: len(m.placeholder), reverse=True)
         
         for mask in sorted_masks:
+            # Try exact match first
             if mask.placeholder in unmasked_text:
                 unmasked_text = unmasked_text.replace(mask.placeholder, mask.original)
                 restored_count += 1
+            elif self.config.tolerant_unmasking:
+                # Try variant matching
+                found = False
+                for pattern in self.find_placeholder_variants(mask.placeholder):
+                    matches = list(re.finditer(pattern, unmasked_text, re.IGNORECASE))
+                    if matches:
+                        # Replace all matches of this variant
+                        for match in reversed(matches):  # Reverse to preserve positions
+                            unmasked_text = unmasked_text[:match.start()] + mask.original + unmasked_text[match.end():]
+                        restored_count += 1
+                        found = True
+                        logger.debug(f"Restored {mask.placeholder} using variant pattern: {pattern}")
+                        break
+                
+                if not found:
+                    missing_masks.append(mask.placeholder)
             else:
                 missing_masks.append(mask.placeholder)
+                
+        # Store restoration metadata in block
+        if not hasattr(block, 'metadata') or block.metadata is None:
+            from scitran.core.models import TranslationMetadata
+            from datetime import datetime
+            block.metadata = TranslationMetadata(
+                backend="unknown",
+                timestamp=datetime.now(),
+                duration=0.0
+            )
+        
+        block.metadata.restored_masks = restored_count
+        block.metadata.missing_placeholders = missing_masks
                 
         if validate and self.config.strict_validation and missing_masks:
             error_msg = f"Block {block.block_id}: Missing masks: {missing_masks}"
@@ -427,11 +513,22 @@ class MaskingEngine:
         return len(missing) == 0, missing
     
     def _generate_placeholder(self, mask_type: str) -> str:
-        """Generate unique placeholder token."""
+        """Generate unique placeholder token based on configured style."""
         self.mask_counter[mask_type] += 1
         count = self.mask_counter[mask_type]
-        # Use distinctive format that won't appear naturally
-        return f"<<{mask_type.upper()}_{count:04d}>>"
+        
+        mask_type_upper = mask_type.upper() if self.config.placeholder_case == "upper" else mask_type.lower()
+        
+        if self.config.placeholder_style == "alnum":
+            # Alphanumeric only - safer for free backends
+            # Format: SCITRANS_TYPE_0001_SCITRANS
+            prefix = self.config.placeholder_prefix.upper() if self.config.placeholder_case == "upper" else self.config.placeholder_prefix.lower()
+            suffix = self.config.placeholder_suffix.upper() if self.config.placeholder_case == "upper" else self.config.placeholder_suffix.lower()
+            return f"{prefix}_{mask_type_upper}_{count:04d}_{suffix}"
+        else:
+            # Angle bracket style (default) - works well with LLM backends
+            # Format: <<TYPE_0001>>
+            return f"<<{mask_type_upper}_{count:04d}>>"
     
     def get_statistics(self) -> Dict[str, any]:
         """Get masking statistics."""

@@ -480,8 +480,15 @@ class AdvancedReranker:
             if valid_scored:
                 scored = valid_scored
             else:
-                # No candidate preserves all masks - log warning
-                logger.warning(f"Block {block.block_id}: No candidate preserves all masks")
+                # No candidate preserves all masks - log warning but continue with best candidate
+                # This allows translation to proceed even if masks are lost (better than failing completely)
+                masks_total = scored[0].dimensions['format'].details.get('masks_total', 0) if scored else 0
+                masks_preserved = scored[0].dimensions['format'].details.get('masks_preserved', 0) if scored else 0
+                logger.warning(
+                    f"Block {block.block_id}: No candidate preserves all masks "
+                    f"({masks_preserved}/{masks_total} preserved). Using best candidate anyway."
+                )
+                # Continue with best candidate - better than failing completely
         
         # Record reranking decision
         self.reranking_history.append({
