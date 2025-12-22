@@ -143,10 +143,10 @@ class AnthropicBackend(TranslationBackend):
                 )
                 
                 translations.append(response.content[0].text.strip())
+                tokens_used += response.usage.input_tokens + response.usage.output_tokens
             
             # STEP 3: Clean all translations
             translations = clean_batch_outputs(translations)
-                tokens_used += response.usage.input_tokens + response.usage.output_tokens
             
             cost_per_1k = self.MODELS.get(self.model, {}).get("cost_per_1k", 0.003)
             cost = (tokens_used / 1000) * cost_per_1k

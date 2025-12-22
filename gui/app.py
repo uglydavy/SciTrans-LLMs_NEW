@@ -519,7 +519,9 @@ class SciTransGUI:
                 font_files=[f.strip() for f in font_files.split(",") if f.strip()] if font_files else None,
                 font_priority=[p.strip().lower() for p in font_priority.split(",") if p.strip()] if font_priority else None,
                 overflow_strategy="shrink",  # PHASE 3.2: Default to shrink for GUI
-                min_font_size=4.0
+                min_font_size=4.0,
+                target_lang=target_lang,  # STEP 7: Enable font resolution for non-Latin scripts
+                download_fonts=True  # STEP 7: Download fonts if missing
             )
 
             renderer.render_with_layout(str(input_path), result.document, str(temp_output_path))
