@@ -11,6 +11,7 @@ except ImportError:
     HAS_OPENAI = False
 
 from ..base import TranslationBackend, TranslationRequest, TranslationResponse
+from ..output_cleaner import clean_batch_outputs
 
 
 class DeepSeekBackend(TranslationBackend):
@@ -45,24 +46,36 @@ class DeepSeekBackend(TranslationBackend):
         self.async_client = AsyncOpenAI(api_key=self.api_key, base_url=self.BASE_URL)
     
     def _build_messages(self, request: TranslationRequest):
-        """Build messages for DeepSeek API."""
+        """Build messages for DeepSeek API (STEP 3: clean separation)."""
         messages = []
         
+        # STEP 3: System prompt contains ALL instructions
         if request.system_prompt:
             messages.append({"role": "system", "content": request.system_prompt})
         else:
-            system = f"You are a professional translator. Translate from {request.source_lang} to {request.target_lang}. Preserve all formatting."
-            messages.append({"role": "system", "content": system})
+            system_parts = [
+                f"You are a professional translator specializing in scientific documents.",
+                f"Translate from {request.source_lang} to {request.target_lang}.",
+                "",
+                "CRITICAL RULES:",
+                "- Output ONLY the translated text",
+                "- No explanations, no labels",
+                "- Preserve all placeholder tokens EXACTLY",
+                "- Preserve formatting and structure",
+            ]
+            
+            if request.context:
+                context_text = "\n".join(request.context[-3:])
+                system_parts.append(f"\nContext:\n{context_text}")
+            
+            if request.glossary:
+                glossary_text = "\n".join([f"- {k} → {v}" for k, v in request.glossary.items()])
+                system_parts.append(f"\nTerminology:\n{glossary_text}")
+            
+            messages.append({"role": "system", "content": "\n".join(system_parts)})
         
-        if request.context:
-            context_text = "\n\n".join(request.context[-3:])
-            messages.append({"role": "system", "content": f"Context:\n{context_text}"})
-        
-        if request.glossary:
-            glossary_text = "\n".join([f"- {k} → {v}" for k, v in request.glossary.items()])
-            messages.append({"role": "system", "content": f"Terminology:\n{glossary_text}"})
-        
-        messages.append({"role": "user", "content": f"Translate:\n\n{request.text}"})
+        # STEP 3: User message is ONLY the text (no wrapper)
+        messages.append({"role": "user", "content": request.text})
         
         return messages
     
@@ -85,7 +98,9 @@ class DeepSeekBackend(TranslationBackend):
                 max_tokens=4096
             )
             
-            translations = [choice.message.content.strip() for choice in response.choices]
+            # STEP 3: Clean outputs
+            raw_translations = [choice.message.content.strip() for choice in response.choices]
+            translations = clean_batch_outputs(raw_translations)
             finish_reasons = [choice.finish_reason for choice in response.choices]
             tokens_used = response.usage.total_tokens if response.usage else 0
             
@@ -129,7 +144,9 @@ class DeepSeekBackend(TranslationBackend):
                 max_tokens=4096
             )
             
-            translations = [choice.message.content.strip() for choice in response.choices]
+            # STEP 3: Clean outputs
+            raw_translations = [choice.message.content.strip() for choice in response.choices]
+            translations = clean_batch_outputs(raw_translations)
             finish_reasons = [choice.finish_reason for choice in response.choices]
             tokens_used = response.usage.total_tokens if response.usage else 0
             

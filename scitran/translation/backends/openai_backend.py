@@ -12,6 +12,7 @@ except ImportError:
     HAS_OPENAI = False
 
 from ..base import TranslationBackend, TranslationRequest, TranslationResponse
+from ..output_cleaner import clean_batch_outputs
 
 
 class OpenAIBackend(TranslationBackend):
@@ -44,11 +45,21 @@ class OpenAIBackend(TranslationBackend):
         """Build messages for OpenAI API."""
         messages = []
         
-        # System prompt
+        # STEP 3: System prompt contains ALL instructions
         if request.system_prompt:
             messages.append({"role": "system", "content": request.system_prompt})
         else:
-            system = f"You are a professional translator specializing in scientific and technical documents. Translate from {request.source_lang} to {request.target_lang}."
+            # Default system prompt with strict output rules
+            system = f"""You are a professional translator specializing in scientific and technical documents.
+
+Translate from {request.source_lang} to {request.target_lang}.
+
+CRITICAL RULES:
+- Output ONLY the translated text
+- No explanations, no commentary, no labels like "Translation:"
+- Preserve all placeholder tokens EXACTLY (e.g., <<FORMULA_0001>>, SCITRANS_CODE_0001_SCITRANS)
+- Preserve LaTeX formulas, code blocks, URLs, DOIs unchanged
+- Maintain formatting and structure"""
             messages.append({"role": "system", "content": system})
         
         # Context (if provided)
@@ -67,10 +78,11 @@ class OpenAIBackend(TranslationBackend):
                 "content": f"Use these terminology translations:\n{glossary_text}"
             })
         
-        # User text
+        # STEP 3: User message is ONLY the text to translate (no instruction wrapper)
+        # The system prompt already contains all translation instructions
         messages.append({
             "role": "user",
-            "content": f"Translate the following text from {request.source_lang} to {request.target_lang}:\n\n{request.text}"
+            "content": request.text
         })
         
         return messages
@@ -94,7 +106,9 @@ class OpenAIBackend(TranslationBackend):
                 max_tokens=4096
             )
             
-            translations = [choice.message.content.strip() for choice in response.choices]
+            # STEP 3: Clean outputs to remove reasoning wrappers and labels
+            raw_translations = [choice.message.content.strip() for choice in response.choices]
+            translations = clean_batch_outputs(raw_translations)
             finish_reasons = [choice.finish_reason for choice in response.choices]
             tokens_used = response.usage.total_tokens if response.usage else 0
             
@@ -139,7 +153,9 @@ class OpenAIBackend(TranslationBackend):
                 n=n,
                 max_tokens=4096
             )
-            translations = [choice.message.content.strip() for choice in response.choices]
+            # STEP 3: Clean outputs to remove reasoning wrappers and labels
+            raw_translations = [choice.message.content.strip() for choice in response.choices]
+            translations = clean_batch_outputs(raw_translations)
             finish_reasons = [choice.finish_reason for choice in response.choices]
             tokens_used = response.usage.total_tokens if response.usage else 0
             

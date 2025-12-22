@@ -17,7 +17,8 @@ class TranslationRequest:
     context: List[str] = None
     glossary: Dict[str, str] = None
     system_prompt: Optional[str] = None
-    temperature: float = 0.3
+    # STEP 3: Temperature=0.0 for deterministic output (prevents placeholder corruption)
+    temperature: float = 0.0
     num_candidates: int = 1
 
 

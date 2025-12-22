@@ -12,6 +12,7 @@ except ImportError:
     HAS_ANTHROPIC = False
 
 from ..base import TranslationBackend, TranslationRequest, TranslationResponse
+from ..output_cleaner import clean_batch_outputs
 
 
 class AnthropicBackend(TranslationBackend):
@@ -38,22 +39,32 @@ class AnthropicBackend(TranslationBackend):
             self.client = None
             self.async_client = None
     
-    def _build_prompt(self, request: TranslationRequest):
-        """Build prompt for Claude."""
-        parts = []
+    def _build_system_prompt(self, request: TranslationRequest):
+        """Build system prompt for Claude (STEP 3: all instructions in system)."""
+        if request.system_prompt:
+            return request.system_prompt
+        
+        parts = [
+            f"You are a professional translator specializing in scientific and technical documents.",
+            f"Translate from {request.source_lang} to {request.target_lang}.",
+            "",
+            "CRITICAL RULES:",
+            "- Output ONLY the translated text",
+            "- No explanations, no commentary, no labels",
+            "- Preserve all placeholder tokens EXACTLY (e.g., <<FORMULA_0001>>)",
+            "- Preserve LaTeX formulas, code blocks, URLs unchanged",
+            "- Maintain formatting and structure",
+        ]
         
         if request.context:
-            context_text = "\n\n".join(request.context[-3:])
-            parts.append(f"Context from previous translations:\n{context_text}")
+            context_text = "\n".join(request.context[-3:])
+            parts.append(f"\nContext from previous translations:\n{context_text}")
         
         if request.glossary:
             glossary_text = "\n".join([f"- {k} → {v}" for k, v in request.glossary.items()])
-            parts.append(f"Use these terminology translations:\n{glossary_text}")
+            parts.append(f"\nUse these terminology translations:\n{glossary_text}")
         
-        parts.append(f"Translate the following text from {request.source_lang} to {request.target_lang}:")
-        parts.append(f"\n{request.text}")
-        
-        return "\n\n".join(parts)
+        return "\n".join(parts)
     
     async def translate(self, request: TranslationRequest) -> TranslationResponse:
         """Translate asynchronously with concurrent requests for multiple candidates."""
@@ -62,8 +73,9 @@ class AnthropicBackend(TranslationBackend):
         
         start_time = time.time()
         
-        system = request.system_prompt or f"You are a professional translator specializing in scientific and technical documents. Translate from {request.source_lang} to {request.target_lang}. Preserve all formatting, LaTeX, code, and special symbols exactly."
-        user_prompt = self._build_prompt(request)
+        # STEP 3: System prompt contains ALL instructions, user message is ONLY text
+        system = self._build_system_prompt(request)
+        user_prompt = request.text  # Just the text, no wrapper
         
         try:
             # Run multiple candidate requests concurrently
@@ -80,7 +92,9 @@ class AnthropicBackend(TranslationBackend):
             # Gather all candidates concurrently
             responses = await asyncio.gather(*[get_candidate() for _ in range(request.num_candidates)])
             
-            translations = [resp.content[0].text.strip() for resp in responses]
+            # STEP 3: Clean outputs
+            raw_translations = [resp.content[0].text.strip() for resp in responses]
+            translations = clean_batch_outputs(raw_translations)
             finish_reasons = [resp.stop_reason for resp in responses]
             tokens_used = sum(resp.usage.input_tokens + resp.usage.output_tokens for resp in responses)
             
@@ -111,8 +125,9 @@ class AnthropicBackend(TranslationBackend):
         
         start_time = time.time()
         
-        system = request.system_prompt or f"You are a professional translator specializing in scientific and technical documents. Translate from {request.source_lang} to {request.target_lang}. Preserve all formatting, LaTeX, code, and special symbols exactly."
-        user_prompt = self._build_prompt(request)
+        # STEP 3: System prompt contains ALL instructions, user message is ONLY text
+        system = self._build_system_prompt(request)
+        user_prompt = request.text  # Just the text, no wrapper
         
         try:
             translations = []
@@ -128,6 +143,9 @@ class AnthropicBackend(TranslationBackend):
                 )
                 
                 translations.append(response.content[0].text.strip())
+            
+            # STEP 3: Clean all translations
+            translations = clean_batch_outputs(translations)
                 tokens_used += response.usage.input_tokens + response.usage.output_tokens
             
             cost_per_1k = self.MODELS.get(self.model, {}).get("cost_per_1k", 0.003)
