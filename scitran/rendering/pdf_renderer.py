@@ -474,6 +474,13 @@ class PDFRenderer:
         
         logger.info(f"Processed {pages_processed} pages with translations out of {total_pages_in_doc} total pages")
         
+        # STEP 5: Create overflow pages if strategy is append_pages
+        if self.overflow_strategy in ["append_pages", "marker+append_pages"]:
+            overflow_blocks = [e for e in self.overflow_report if "full_text" in e]
+            if overflow_blocks:
+                logger.info(f"Creating overflow pages for {len(overflow_blocks)} blocks")
+                self._create_overflow_pages(doc, overflow_blocks)
+        
         # Save output (embed fonts if requested)
         save_opts = {"garbage": 4, "deflate": True}
         if self.embed_fonts:
@@ -638,6 +645,98 @@ class PDFRenderer:
         
         else:
             logger.error(f"Unknown overflow strategy: {self.overflow_strategy}")
+    
+    def _create_overflow_pages(self, doc, overflow_blocks: List[Dict[str, Any]]):
+        """
+        Create additional pages for overflow text (STEP 5).
+        
+        Args:
+            doc: PyMuPDF document
+            overflow_blocks: List of overflow event dicts with full_text
+        """
+        if not overflow_blocks:
+            return
+        
+        # Group by page for better organization
+        by_page = {}
+        for event in overflow_blocks:
+            page_num = event.get("page", 0)
+            if page_num not in by_page:
+                by_page[page_num] = []
+            by_page[page_num].append(event)
+        
+        # Create overflow pages
+        for page_num, events in sorted(by_page.items()):
+            # Create new page
+            overflow_page = doc.new_page(
+                width=doc[0].rect.width if len(doc) > 0 else 595,
+                height=doc[0].rect.height if len(doc) > 0 else 842
+            )
+            
+            # Add header
+            header_rect = fitz.Rect(50, 50, overflow_page.rect.width - 50, 80)
+            overflow_page.insert_textbox(
+                header_rect,
+                f"Overflow from page {page_num + 1}",
+                fontsize=14,
+                fontname="hebo",
+                color=(0.5, 0, 0),
+                align=1  # Center
+            )
+            
+            # Place overflow texts
+            y_position = 100
+            margin = 50
+            
+            for event in events:
+                text = event.get("full_text", "")
+                if not text:
+                    continue
+                
+                fontsize = event.get("fontsize", 11)
+                fontname = event.get("fontname", "helv")
+                color = event.get("color", (0, 0, 0))
+                
+                # Calculate available space
+                available_height = overflow_page.rect.height - y_position - margin
+                
+                if available_height < 50:
+                    # Need another page
+                    overflow_page = doc.new_page(
+                        width=doc[0].rect.width,
+                        height=doc[0].rect.height
+                    )
+                    y_position = 50
+                    available_height = overflow_page.rect.height - y_position - margin
+                
+                # Insert text
+                rect = fitz.Rect(
+                    margin,
+                    y_position,
+                    overflow_page.rect.width - margin,
+                    y_position + available_height
+                )
+                
+                try:
+                    rc = overflow_page.insert_textbox(
+                        rect,
+                        text,
+                        fontsize=fontsize * 0.9,  # Slightly smaller
+                        fontname=fontname,
+                        color=color,
+                        align=0,  # Left align
+                        lineheight=1.2
+                    )
+                    
+                    # Estimate space used (rough)
+                    lines_used = text.count('\n') + 1
+                    y_position += lines_used * fontsize * 1.2 + 20
+                    
+                except Exception as e:
+                    logger.error(f"Failed to insert overflow text: {e}")
+                    y_position += 50
+        
+        logger.info(f"Created overflow pages, total pages now: {len(doc)}")
     
     def _stamp_preserved_blocks(self, target_page, source_page, blocks: List[Block]):
         """Stamp source regions for tables/equations/figures - VECTOR ONLY (no rasterization).
