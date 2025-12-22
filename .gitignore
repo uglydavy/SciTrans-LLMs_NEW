@@ -95,3 +95,21 @@ translations.db
 .scitrans/
 *_translated.pdf
 *_translated_*.pdf
+
+# STEP 9: Additional ignores
+# Test outputs
+test_translated.pdf
+test.pdf
+repro_output/
+overflow_report.json
+*_overflow_report.json
+
+# Large sample PDFs (keep only small test PDFs)
+alphafold.pdf
+attention_is_all_you_need.pdf
+clip_paper.pdf
+primes_in_arithmetic.pdf
+quantum_supremacy.pdf
+
+# Thesis artifacts (if not needed in repo)
+thesis/results/translations/
