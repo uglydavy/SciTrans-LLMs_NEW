@@ -14,6 +14,7 @@ except ImportError:
     HAS_PYMUPDF = False
 
 from ..core.models import Document, Block, FontInfo, BlockType
+from .font_resolver import resolve_font_for_language
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,9 @@ class PDFRenderer:
         overflow_strategy: str = "shrink",  # "shrink", "expand", "append_pages", "marker+append_pages"
         min_font_size: float = 4.0,  # Minimum font size when shrinking
         min_lineheight: float = 0.95,  # Minimum line height multiplier
+        # STEP 7: Font resolution for non-Latin scripts
+        target_lang: Optional[str] = None,  # Target language for font resolution
+        download_fonts: bool = True,  # Download fonts if missing
     ):
         if not HAS_PYMUPDF:
             raise ImportError("PyMuPDF not installed. Run: pip install PyMuPDF")
@@ -87,6 +91,19 @@ class PDFRenderer:
         self.min_font_size = min_font_size
         self.min_lineheight = min_lineheight
         self.overflow_report = []  # Track overflow events
+        
+        # STEP 7: Font resolution for non-Latin scripts
+        self.target_lang = target_lang
+        self.download_fonts = download_fonts
+        self._resolved_font: Optional[str] = None
+        if target_lang and download_fonts:
+            try:
+                font_path = resolve_font_for_language(target_lang, download_enabled=True)
+                if font_path and font_path.exists():
+                    self._resolved_font = str(font_path)
+                    logger.info(f"Resolved font for {target_lang}: {font_path.name}")
+            except Exception as e:
+                logger.warning(f"Font resolution failed for {target_lang}: {e}")
     
     def cleanup(self):
         """Clean up temporary files."""
