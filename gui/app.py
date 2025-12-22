@@ -79,7 +79,7 @@ class SciTransGUI:
     def _default_config(self):
         return {
             "dark_mode": True,
-            "default_backend": "free",
+            "default_backend": "deepseek",
             "api_keys": {},
             "reranking_enabled": True,
             "masking_enabled": True,
@@ -342,6 +342,29 @@ class SciTransGUI:
             # Load API key for the selected backend
             api_key = self._load_api_key_for_backend(backend)
             
+            # Check if API key is required but missing
+            requires_api_key = backend.lower() in ["openai", "anthropic", "deepseek", "huggingface"]
+            if requires_api_key and not api_key:
+                error_msg = (
+                    f"❌ Backend '{backend}' requires an API key.\n\n"
+                    f"Please set your API key:\n"
+                    f"1. Go to Settings tab\n"
+                    f"2. Enter your {backend.upper()}_API_KEY\n"
+                    f"3. Or set environment variable: {backend.upper()}_API_KEY\n\n"
+                    f"💡 Tip: Use 'free' or 'cascade' backend for testing without API keys."
+                )
+                return (
+                    error_msg,
+                    gr.update(value=None, visible=False),
+                    error_msg,
+                    None,
+                    "of 0",
+                    gr.update(maximum=1, value=1),
+                    self.source_pdf_path if hasattr(self, 'source_pdf_path') and self.source_pdf_path else None,
+                    "",
+                    f"Error: {backend} backend requires API key. See error message above."
+                )
+            
             # PHASE 1.3: Check if fast mode should be enabled (no reranking + single candidate)
             fast_mode_enabled = not enable_reranking and safe_int(num_candidates, 1) == 1
             
@@ -483,7 +506,9 @@ class SciTransGUI:
             progress(0.9, desc="Rendering PDF...")
             add_log("Rendering translated PDF (clearing source text, preserving layout)...")
             
-            # Save PDF to temp directory first (Gradio requirement), then copy to persistent location
+            # Save PDF to system temp directory (Gradio requirement)
+            # Use tempfile to get proper temp directory that Gradio allows
+            import tempfile
             temp_output_dir = Path(tempfile.gettempdir()) / "scitrans"
             temp_output_dir.mkdir(exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -535,10 +560,13 @@ class SciTransGUI:
                     "No preview available - PDF creation failed."
                 )
             
-            self.translated_pdf_path = str(temp_output_path)
-            # Keep source PDF path stored for preview
+            # Store paths as absolute paths for Gradio File components
+            self.translated_pdf_path = str(Path(temp_output_path).resolve())
+            # Keep source PDF path stored for preview (ensure absolute)
             if not self.source_pdf_path:
-                self.source_pdf_path = str(input_path)
+                self.source_pdf_path = str(Path(input_path).resolve())
+            else:
+                self.source_pdf_path = str(Path(self.source_pdf_path).resolve())
             
             progress(1.0, desc="Complete!")
             add_log("Translation complete!")
@@ -571,23 +599,18 @@ class SciTransGUI:
             page_update = gr.update(maximum=max(1, translated_pages), value=1)
             page_total_text = f"of {max(1, translated_pages)}"
             
-            # Store source PDF path if not already stored
-            if not self.source_pdf_path:
-                self.source_pdf_path = str(input_path)
-            
-            # Log before return to catch any errors during return
-            
-            # Ensure source path is a string for File component
-            source_path_str = self.source_pdf_path if self.source_pdf_path else (str(input_path) if input_path else None)
+            # Ensure paths are absolute for Gradio File components
+            translated_path_str = str(Path(temp_output_path).resolve())
+            source_path_str = str(Path(self.source_pdf_path).resolve()) if self.source_pdf_path else (str(Path(input_path).resolve()) if input_path else None)
             
             return (
                 status,
-                gr.update(value=str(temp_output_path), visible=True, interactive=True),
+                gr.update(value=translated_path_str, visible=True, interactive=True),
                 "\n".join(logs),
-                str(temp_output_path),  # Return PDF file path for File component (translated)
+                translated_path_str,  # Return PDF file path for File component (translated) - absolute path
                 page_total_text,
                 page_update,
-                source_path_str,  # Return source PDF path for File component
+                source_path_str,  # Return source PDF path for File component - absolute path
                 perf_text,
                 translation_preview_text,
             )
@@ -654,15 +677,30 @@ class SciTransGUI:
             except:
                 perf_text = "Error occurred. Check logs for details."
             
+            # Ensure source PDF path is available for preview even on error
+            source_path_str = None
+            if hasattr(self, 'source_pdf_path') and self.source_pdf_path:
+                try:
+                    source_path_str = str(Path(self.source_pdf_path).resolve())
+                except:
+                    pass
+            
+            # If we have input_path from earlier, use it
+            if not source_path_str and 'input_path' in locals():
+                try:
+                    source_path_str = str(Path(input_path).resolve())
+                except:
+                    pass
+            
             # Final return - guaranteed to return 9 values
             return (
                 full_error,
                 gr.update(value=None, visible=False, interactive=False),
                 logs_str,
-                None,
+                None,  # Translated PDF (None on error)
                 "of 0",
                 gr.update(maximum=1, value=1),
-                None,
+                source_path_str,  # Source PDF (show even on error)
                 perf_text,
                 translation_preview_text
             )
@@ -1750,9 +1788,9 @@ class SciTransGUI:
                 # ===========================================================
                 with gr.Tab("Translation"):
                     allowed_backends = ["cascade", "free", "ollama", "openai", "anthropic", "deepseek", "local", "libre", "argos"]
-                    initial_backend = self.config.get("default_backend", "free")
+                    initial_backend = self.config.get("default_backend", "deepseek")
                     if initial_backend not in allowed_backends:
-                        initial_backend = "free"
+                        initial_backend = "deepseek"
                     initial_model_opts = self._get_model_options_for_backend(initial_backend)
                     # Ensure initial model value is always valid (never "default" for backends that don't support it)
                     if initial_backend in ["ollama", "huggingface", "openai", "anthropic", "deepseek"]:
@@ -2127,7 +2165,7 @@ Copy these to test different formatting:
                             
                             set_backend = gr.Dropdown(
                                 ["cascade", "free", "ollama", "openai", "anthropic", "deepseek", "local", "libre", "argos", "huggingface"],
-                                value=self.config.get("default_backend", "cascade"),
+                                value=self.config.get("default_backend", "deepseek"),
                                 label="Default Backend",
                                 info="Backend to use by default"
                             )
@@ -2400,8 +2438,9 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                 if pdf is None:
                     self.source_pdf_path = None
                     return None, None, gr.update(maximum=1, value=1), "of 1", gr.update(visible=False, value="")
-                # Store source PDF path for preview
+                # Store source PDF path for preview (ensure absolute path)
                 pdf_path = pdf.name if hasattr(pdf, 'name') else str(pdf)
+                pdf_path = str(Path(pdf_path).resolve())  # Convert to absolute path
                 self.source_pdf_path = pdf_path
                 count = self.get_page_count(pdf)
                 # Return source PDF for source_preview, None for trans_preview (not translated yet)
@@ -2415,7 +2454,8 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                 
                 pdf_path, status_msg = self.download_pdf_from_url(url)
                 if pdf_path:
-                    # Store source PDF path
+                    # Store source PDF path (ensure absolute path)
+                    pdf_path = str(Path(pdf_path).resolve())  # Convert to absolute path
                     self.source_pdf_path = pdf_path
                     # Create a file-like object for Gradio
                     count = self.get_page_count(type('obj', (object,), {'name': pdf_path})())
@@ -2431,10 +2471,14 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
             # Unified page navigation for source and translated previews
             # Update both source and translated previews independently based on page slider
             def nav_page(pdf, page, total, direction):
-                # Get source PDF path (from upload or stored)
+                # Get source PDF path (from upload or stored) - ensure absolute path
                 source_path = self.source_pdf_path if self.source_pdf_path else (pdf.name if hasattr(pdf, 'name') else str(pdf) if pdf else None)
-                # Get translated PDF path (only available after translation)
+                if source_path:
+                    source_path = str(Path(source_path).resolve())
+                # Get translated PDF path (only available after translation) - ensure absolute path
                 trans_path = self.translated_pdf_path if getattr(self, "translated_pdf_path", None) else None
+                if trans_path:
+                    trans_path = str(Path(trans_path).resolve())
                 
                 try:
                     max_p = int(str(total).replace("of", "").strip())
@@ -2650,7 +2694,8 @@ def launch(share=False, port=None):
         server_name="0.0.0.0",
         server_port=port,
         share=share,
-        inbrowser=True
+        inbrowser=True,
+        allowed_paths=[str(Path(tempfile.gettempdir())), str(Path.home() / ".scitrans")]
     )
 
 

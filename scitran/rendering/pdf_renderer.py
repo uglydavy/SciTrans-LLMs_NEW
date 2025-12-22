@@ -338,10 +338,23 @@ class PDFRenderer:
         return layout
     
     def _redact_text_from_page(self, page, blocks: List[Block]) -> None:
-        """Remove source text from specific regions using redaction."""
+        """
+        Remove source text from specific regions using non-destructive redaction.
+        
+        CRITICAL: Uses fill=None to remove text without painting over graphics.
+        This ensures figures, tables, diagrams, and images remain intact.
+        
+        Combined with apply_redactions(images=0, graphics=0), this guarantees
+        that only text is removed while all vector graphics and images are preserved.
+        """
         redact_count = 0
         
         for block in blocks:
+            # Skip protected blocks (table/figure/equation) to avoid overwriting
+            if block.block_type in {BlockType.TABLE, BlockType.FIGURE, BlockType.EQUATION}:
+                continue
+            if block.metadata and block.metadata.get("protected_reason"):
+                continue
             rect = fitz.Rect(
                 block.bbox.x0,
                 block.bbox.y0,
@@ -354,19 +367,21 @@ class PDFRenderer:
                 logger.warning(f"Skipping invalid rect for redaction: {rect}")
                 continue
                 
-            # Add redaction annotation with white fill and no text
+            # Add redaction annotation with NO fill (non-destructive)
+            # CRITICAL: fill=None means remove text only, don't paint over graphics
             page.add_redact_annot(
                 rect, 
-                fill=(1, 1, 1),  # White fill
+                fill=None,  # No fill - preserves underlying graphics/images
                 text="",  # No replacement text
             )
             redact_count += 1
         
         # Apply all redactions - CRITICAL: Must not remove vector graphics or images
+        # Parameters: images, graphics, text (0=keep, 1=remove, 2=remove+mark)
         if redact_count > 0:
             page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_NONE,  # Don't touch images
-                graphics=fitz.PDF_REDACT_GRAPHICS_NONE  # DON'T REMOVE VECTOR GRAPHICS
+                images=0,    # 0 = Keep images (don't remove)
+                graphics=0   # 0 = Keep vector graphics (DON'T REMOVE)
             )
             logger.info(f"Applied {redact_count} redactions on page (text only, preserving graphics)")
     

@@ -374,6 +374,24 @@ class TranslationPipeline:
             result.validation_result = validation_result
             result.coverage = validation_result.coverage
             
+            # Final guard: ensure all translatable blocks have translated_text
+            missing_blocks = [
+                b for b in document.translatable_blocks
+                if not b.translated_text or not b.translated_text.strip()
+            ]
+            if missing_blocks:
+                logger.info(f"Final guard: {len(missing_blocks)} blocks missing translation, retrying best-effort.")
+                self._ensure_all_translated(document, missing_blocks, use_masking)
+                # Recompute coverage
+                validation_result = self.validator.validate(document)
+                result.validation_result = validation_result
+                result.coverage = validation_result.coverage
+                if not validation_result.is_valid and not self.config.allow_partial:
+                    raise ValueError(
+                        f"Translation incomplete after final guard: {len(validation_result.errors)} errors, "
+                        f"coverage {validation_result.coverage:.1%}"
+                    )
+            
             # Save translation artifacts
             if artifacts:
                 artifacts.save_translation(document, validation_result)
@@ -679,6 +697,29 @@ class TranslationPipeline:
         
         # Re-validate after repair
         return self.validator.validate(document)
+
+    def _ensure_all_translated(self, document: Document, missing_blocks: List[Block], use_masking: bool = True) -> None:
+        """Best-effort translation for any remaining missing blocks."""
+        from scitran.translation.base import TranslationRequest
+        for block in missing_blocks:
+            try:
+                text = block.masked_text or block.source_text
+                if not text or not text.strip():
+                    continue
+                request = TranslationRequest(
+                    text=text,
+                    source_lang=self.config.source_lang,
+                    target_lang=self.config.target_lang,
+                    num_candidates=1,
+                    system_prompt="You are a professional translator. Translate accurately and preserve placeholder tokens exactly."
+                )
+                resp = self.translator.translate_sync(request)
+                if resp.translations and resp.translations[0]:
+                    block.translated_text = resp.translations[0]
+                    if use_masking and block.masks:
+                        self.masking_engine.unmask_block(block, validate=False)
+            except Exception as e:
+                logger.debug(f"Final guard translation failed for {block.block_id}: {e}")
     
     def _ensure_translation_coverage(self, document: Document, result: TranslationResult) -> None:
         """SPRINT 1: Ensure ALL translatable blocks have valid translations.
@@ -1718,11 +1759,23 @@ Provide only the refined translation, with no explanations."""
         """Generate fallback translation when primary fails - must translate or raise exception."""
         text = block.masked_text or block.source_text
         
+        # Use fallback translator if available, otherwise create one
+        fallback_translator = getattr(self, '_fallback_translator', None)
+        if not fallback_translator and self.config.enable_fallback_backend:
+            try:
+                fallback_translator = self._create_translator(backend_override=self.config.fallback_backend)
+                if fallback_translator:
+                    self._fallback_translator = fallback_translator
+            except Exception as e:
+                logger.warning(f"Failed to create fallback translator: {e}")
+        
+        # If no fallback translator, try primary translator as last resort
+        translator_to_use = fallback_translator or self.translator
+        if not translator_to_use:
+            raise ValueError(f"No translator available for fallback translation of block {block.block_id}")
+        
         # Try direct translation without fancy prompts
         from scitran.translation.base import TranslationRequest
-        
-        if not self.translator:
-            raise ValueError(f"No translator available for fallback translation of block {block.block_id}")
         
         request = TranslationRequest(
             text=text,
@@ -1731,7 +1784,12 @@ Provide only the refined translation, with no explanations."""
             temperature=0.3,
             num_candidates=1
         )
-        response = self.translator.translate_sync(request)
+        
+        try:
+            response = translator_to_use.translate_sync(request)
+        except Exception as e:
+            raise ValueError(f"Fallback translation failed for block {block.block_id}: {e}")
+        
         if response.translations and response.translations[0]:
             translation = self._postprocess_translation(response.translations[0])
             # Validate not identical to source

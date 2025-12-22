@@ -247,3 +247,4 @@ def map_yolo_classes_to_layout_types(class_names: list) -> Dict[str, str]:
 
 
 
+
