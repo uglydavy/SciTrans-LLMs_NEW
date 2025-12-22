@@ -146,19 +146,32 @@ class Block:
     
     @property
     def is_translatable(self) -> bool:
-        """Check if block should be translated."""
-        non_translatable = {
-            BlockType.EQUATION,
-            BlockType.CODE,
-            BlockType.FIGURE,  # Figure images not translatable
-            BlockType.TABLE,   # Table content not translatable (complex layout)
-            BlockType.HEADER,
-            BlockType.FOOTER,
-            BlockType.METADATA,
+        """
+        Check if block should be translated.
+        
+        NOTE: This is a simplified check. The actual translatability depends on
+        PipelineConfig flags (translate_table_text, translate_figure_text).
+        The pipeline will check those flags when deciding which blocks to translate.
+        
+        This property returns True for blocks that CAN be translated (have text content),
+        not necessarily SHOULD be translated.
+        """
+        # Always non-translatable (no text content or structural only)
+        always_non_translatable = {
+            BlockType.EQUATION,  # LaTeX/math - preserved as-is
+            BlockType.CODE,      # Code blocks - preserved as-is
+            BlockType.HEADER,    # Page headers - usually not translated
+            BlockType.FOOTER,    # Page footers - usually not translated
+            BlockType.METADATA,  # Document metadata - structural
         }
-        # CAPTION is translatable (table/figure captions, labels)
+        
+        # STEP 2: TABLE and FIGURE are now conditionally translatable
+        # They are excluded here only if they truly have no translatable text
+        # The pipeline will check translate_table_text/translate_figure_text flags
+        
+        # CAPTION is always translatable (figure/table captions, labels)
         # TITLE, HEADING, SUBHEADING, PARAGRAPH, etc. are translatable
-        return self.block_type not in non_translatable
+        return self.block_type not in always_non_translatable
     
     @property
     def has_masks(self) -> bool:

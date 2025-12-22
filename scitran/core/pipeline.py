@@ -58,6 +58,10 @@ class PipelineConfig:
     preserve_layout: bool = True
     layout_detection_method: str = "yolo"  # yolo, heuristic, hybrid
     
+    # STEP 2: Table/Figure text translation policy
+    translate_table_text: bool = True  # Translate text inside tables
+    translate_figure_text: bool = True  # Translate text inside figures (captions, labels)
+    
     # Glossary settings (SPRINT 3: Enhanced)
     enable_glossary: bool = True
     glossary_path: Optional[Path] = None
@@ -460,6 +464,26 @@ class TranslationPipeline:
 
         # Reset statistics
         self.stats = {k: 0 for k in self.stats.keys()}
+    
+    def _get_blocks_to_translate(self, document: Document) -> List[Block]:
+        """
+        Get blocks that should be translated based on policy flags.
+        
+        STEP 2: Respects translate_table_text and translate_figure_text flags.
+        """
+        blocks = []
+        for block in document.translatable_blocks:
+            # Check table policy
+            if block.block_type == BlockType.TABLE and not self.config.translate_table_text:
+                continue
+            
+            # Check figure policy
+            if block.block_type == BlockType.FIGURE and not self.config.translate_figure_text:
+                continue
+            
+            blocks.append(block)
+        
+        return blocks
         
     def _translate_all_blocks(self, document: Document):
         """Translate all blocks in the document with batch processing."""

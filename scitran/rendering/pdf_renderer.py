@@ -350,8 +350,9 @@ class PDFRenderer:
         redact_count = 0
         
         for block in blocks:
-            # Skip protected blocks (table/figure/equation) to avoid overwriting
-            if block.block_type in {BlockType.TABLE, BlockType.FIGURE, BlockType.EQUATION}:
+            # Skip protected blocks (equation only - tables/figures are now translatable)
+            # STEP 2: TABLE and FIGURE are no longer automatically protected
+            if block.block_type == BlockType.EQUATION:
                 continue
             if block.metadata and block.metadata.get("protected_reason"):
                 continue
@@ -425,13 +426,10 @@ class PDFRenderer:
                 
                 page_num = block.bbox.page
                 
-                # Collect preservable blocks (tables, equations, figures, captions)
-                if block.block_type in {
-                    BlockType.TABLE,
-                    BlockType.EQUATION,
-                    BlockType.FIGURE,
-                    BlockType.CAPTION,
-                }:
+                # Collect preservable blocks (equations only - tables/figures now translatable)
+                # STEP 2: Only preserve EQUATION blocks (math formulas)
+                # TABLE and FIGURE text will be translated, so don't stamp them
+                if block.block_type == BlockType.EQUATION:
                     preserve_by_page.setdefault(page_num, []).append(block)
                 
                 # Only translated blocks go to redaction/insertion
