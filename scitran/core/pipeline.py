@@ -16,6 +16,7 @@ import json
 import re
 import os
 import unicodedata
+import hashlib
 
 from scitran.core.models import (
     Document, Block, Segment, TranslationResult,
@@ -76,6 +77,7 @@ class PipelineConfig:
     enable_reranking: bool = True
     reranking_strategy: ScoringStrategy = ScoringStrategy.HYBRID
     quality_threshold: float = 0.7  # Minimum acceptable quality score
+    temperature: float = 0.0  # Temperature for translation (0.0 = deterministic, higher = more creative)
     
     # SPRINT 1: Translation coverage guarantee
     strict_mode: bool = True  # Fail loudly if any blocks untranslated
@@ -1319,7 +1321,7 @@ Provide only the refined translation, with no explanations."""
             try:
                 # Temporarily switch to refinement backend
                 self.translator = self._create_translator(backend_override=self.config.refinement_backend)
-                refined = self._call_translator(system_prompt, user_prompt, temperature=0.5)
+                refined = self._call_translator(system_prompt, user_prompt, temperature=self.config.temperature)  # Use config temperature
                 return refined
             finally:
                 # Restore original
@@ -1434,10 +1436,36 @@ Provide only the refined translation, with no explanations."""
         async def translate_batch():
             semaphore = asyncio.Semaphore(max_concurrent)
             results = {}
+            completion_order = []  # Track order of completion for consistency checking
             
             async def translate_one(block, req):
                 async with semaphore:
                     try:
+                        # #region agent log
+                        import json
+                        from datetime import datetime
+                        DEBUG_LOG_PATH = Path("/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log")
+                        try:
+                            log_entry = {
+                                "sessionId": "consistency_check",
+                                "runId": "batch_translation",
+                                "hypothesisId": "H6",
+                                "location": "pipeline.py:_translate_blocks_batch",
+                                "message": "Starting async translation",
+                                "data": {
+                                    "block_id": block.block_id,
+                                    "temperature": req.temperature,
+                                    "has_system_prompt": bool(req.system_prompt),
+                                    "text_hash": hashlib.md5(req.text.encode()).hexdigest()[:8]
+                                },
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                        except Exception:
+                            pass
+                        # #endregion
+                        
                         # Most backends use sync - run in executor to avoid blocking
                         loop = asyncio.get_event_loop()
                         if hasattr(self.translator, 'translate'):
@@ -1456,6 +1484,28 @@ Provide only the refined translation, with no explanations."""
                             # Clean output
                             translation = self._postprocess_translation(translation)
                             results[block.block_id] = translation
+                            completion_order.append(block.block_id)  # Track completion order
+                            
+                            # #region agent log
+                            try:
+                                log_entry = {
+                                    "sessionId": "consistency_check",
+                                    "runId": "batch_translation",
+                                    "hypothesisId": "H7",
+                                    "location": "pipeline.py:_translate_blocks_batch",
+                                    "message": "Translation completed",
+                                    "data": {
+                                        "block_id": block.block_id,
+                                        "translation_hash": hashlib.md5(translation.encode()).hexdigest()[:8],
+                                        "completion_order": len(completion_order)
+                                    },
+                                    "timestamp": datetime.now().isoformat()
+                                }
+                                with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                            except Exception:
+                                pass
+                            # #endregion
                             
                             # Report progress
                             completed = sum(1 for r in results.values() if r is not None)
@@ -1467,7 +1517,33 @@ Provide only the refined translation, with no explanations."""
                         results[block.block_id] = None
             
             # Run all translations concurrently
+            # IMPORTANT: asyncio.gather doesn't guarantee order, but we track completion_order
             await asyncio.gather(*[translate_one(block, req) for block, req in requests])
+            
+            # #region agent log
+            try:
+                import json
+                from datetime import datetime
+                DEBUG_LOG_PATH = Path("/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log")
+                log_entry = {
+                    "sessionId": "consistency_check",
+                    "runId": "batch_translation",
+                    "hypothesisId": "H8",
+                    "location": "pipeline.py:_translate_blocks_batch",
+                    "message": "Batch translation complete",
+                    "data": {
+                        "completion_order": completion_order,
+                        "request_order": [block.block_id for block, _ in requests],
+                        "order_matches": completion_order == [block.block_id for block, _ in requests]
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+                with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
+            # #endregion
+            
             return results
         
         # Run async batch
@@ -1593,6 +1669,32 @@ Provide only the refined translation, with no explanations."""
                 
                 # Rerank and select best
                 if self.config.enable_reranking and len(candidates) > 1:
+                    # #region agent log
+                    try:
+                        import json
+                        import hashlib
+                        from datetime import datetime
+                        DEBUG_LOG_PATH = Path("/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log")
+                        candidate_hashes = [hashlib.md5(c.encode()).hexdigest()[:8] for c in candidates]
+                        log_entry = {
+                            "sessionId": "consistency_check",
+                            "runId": "sequential_translation",
+                            "hypothesisId": "H9",
+                            "location": "pipeline.py:_translate_blocks_sequential",
+                            "message": "Before reranking",
+                            "data": {
+                                "block_id": block.block_id,
+                                "num_candidates": len(candidates),
+                                "candidate_hashes": candidate_hashes
+                            },
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                    except Exception:
+                        pass
+                    # #endregion
+                    
                     best_translation, scored = self.reranker.rerank(
                         candidates=candidates,
                         block=block,
@@ -1600,6 +1702,30 @@ Provide only the refined translation, with no explanations."""
                         context=context,
                         require_all_masks=self.config.validate_mask_restoration
                     )
+                    
+                    # #region agent log
+                    try:
+                        selected_hash = hashlib.md5(best_translation.encode()).hexdigest()[:8] if best_translation else None
+                        selected_idx = candidate_hashes.index(selected_hash) if selected_hash and selected_hash in candidate_hashes else -1
+                        log_entry = {
+                            "sessionId": "consistency_check",
+                            "runId": "sequential_translation",
+                            "hypothesisId": "H10",
+                            "location": "pipeline.py:_translate_blocks_sequential",
+                            "message": "After reranking",
+                            "data": {
+                                "block_id": block.block_id,
+                                "selected_candidate_idx": selected_idx,
+                                "selected_hash": selected_hash,
+                                "scores": [s.score for s in scored] if scored else []
+                            },
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                    except Exception:
+                        pass
+                    # #endregion
                     
                     # Check if reranking improved quality
                     if scored and scored[0].candidate_id != 0:
@@ -1679,7 +1805,7 @@ Provide only the refined translation, with no explanations."""
                 source_lang=self.config.source_lang,
                 target_lang=self.config.target_lang,
                 system_prompt=system_prompt,
-                temperature=0.3,
+                temperature=self.config.temperature,  # Use config temperature for consistency
                 num_candidates=self.config.num_candidates,
                 glossary=self.glossary
             )
@@ -1687,8 +1813,10 @@ Provide only the refined translation, with no explanations."""
             candidates = response.translations if response.translations else []
         else:
             # Backend doesn't support batch - generate one at a time
+            # Use same temperature for all candidates to ensure consistency
+            # (varying temperature would cause non-deterministic results)
             for i in range(self.config.num_candidates):
-                candidate = self._call_translator(system_prompt, user_prompt, temperature=0.3 + i*0.2)
+                candidate = self._call_translator(system_prompt, user_prompt, temperature=self.config.temperature)
                 candidates.append(candidate)
             
         self.stats['total_candidates'] += len(candidates)
@@ -1851,7 +1979,7 @@ Provide only the refined translation, with no explanations."""
             text=text,
             source_lang=self.config.source_lang,
             target_lang=self.config.target_lang,
-            temperature=0.3,
+            temperature=self.config.temperature,  # Use config temperature for consistency
             num_candidates=1
         )
         
