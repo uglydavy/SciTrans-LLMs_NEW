@@ -597,22 +597,26 @@ class SciTransGUI:
                 perf_text += f"• Batch cached: {stats.get('batch_cache_hits', 0)}"
             
             
-            # Return PDF file path for File component
+            # Return PDF file path for download button, images for preview
             page_update = gr.update(maximum=max(1, translated_pages), value=1)
             page_total_text = f"of {max(1, translated_pages)}"
             
-            # Ensure paths are absolute for Gradio File components
+            # Ensure paths are absolute
             translated_path_str = str(Path(temp_output_path).resolve())
             source_path_str = str(Path(self.source_pdf_path).resolve()) if self.source_pdf_path else (str(Path(input_path).resolve()) if input_path else None)
             
+            # Render first pages as images for preview
+            source_img = self.render_pdf_page(source_path_str, 0) if source_path_str else None
+            trans_img = self.render_pdf_page(translated_path_str, 0) if translated_path_str else None
+            
             return (
                 status,
-                gr.update(value=translated_path_str, visible=True, interactive=True),
+                gr.update(value=translated_path_str, visible=True, interactive=True),  # Download button gets file path
                 "\n".join(logs),
-                translated_path_str,  # Return PDF file path for File component (translated) - absolute path
+                trans_img,  # Return rendered image for translated preview
                 page_total_text,
                 page_update,
-                source_path_str,  # Return source PDF path for File component - absolute path
+                source_img,  # Return rendered image for source preview
                 perf_text,
                 translation_preview_text,
             )
@@ -694,15 +698,18 @@ class SciTransGUI:
                 except:
                     pass
             
+            # Render source PDF page as image if available
+            source_img = self.render_pdf_page(source_path_str, 0) if source_path_str else None
+            
             # Final return - guaranteed to return 9 values
             return (
                 full_error,
                 gr.update(value=None, visible=False, interactive=False),
                 logs_str,
-                None,  # Translated PDF (None on error)
+                None,  # Translated PDF image (None on error)
                 "of 0",
                 gr.update(maximum=1, value=1),
-                source_path_str,  # Source PDF (show even on error)
+                source_img,  # Source PDF image (show even on error)
                 perf_text,
                 translation_preview_text
             )
@@ -810,6 +817,51 @@ class SciTransGUI:
             return count
         except:
             return 1
+    
+    def render_pdf_page(self, pdf_path: Optional[str], page_num: int = 0):
+        """
+        Render a PDF page to numpy array for Gradio Image preview.
+        
+        Args:
+            pdf_path: Path to PDF file
+            page_num: Page number (0-indexed)
+            
+        Returns:
+            numpy array (H, W, 3) or None if error
+        """
+        if not pdf_path or not Path(pdf_path).exists():
+            return None
+        
+        try:
+            import fitz
+            import numpy as np
+            
+            with fitz.open(pdf_path) as doc:
+                if page_num < 0 or page_num >= len(doc):
+                    page_num = 0
+                
+                page = doc[page_num]
+                # Render at 150 DPI for good quality
+                pix = page.get_pixmap(matrix=fitz.Matrix(150/72, 150/72))
+                
+                # Convert to numpy array (Gradio Image accepts numpy arrays)
+                # pix.samples is a bytes object, shape is (height, width, n)
+                img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                    pix.height, pix.width, pix.n
+                )
+                
+                # If RGBA, convert to RGB (Gradio prefers RGB)
+                if pix.n == 4:
+                    # Remove alpha channel
+                    img_array = img_array[:, :, :3]
+                elif pix.n == 1:
+                    # Grayscale to RGB
+                    img_array = np.stack([img_array[:, :, 0]] * 3, axis=2)
+                
+                return img_array
+        except Exception as e:
+            logger.error(f"Error rendering PDF page {page_num} from {pdf_path}: {e}")
+            return None
     
     def download_pdf_from_url(self, url):
         """Download PDF from URL and return file path."""
@@ -1971,24 +2023,24 @@ class SciTransGUI:
                                 visible=False
                             )
                             
-                            # Preview area with fullscreen support
-                            # Use File components for PDF previews (Gradio will render PDFs natively)
+                            # Preview area with PDF rendering to images
+                            # STEP 8: Render PDFs to images for proper preview
                             with gr.Tabs(selected=0):  # selected=0 prevents auto-switching
                                 with gr.Tab("Source"):
-                                    source_preview = gr.File(
+                                    source_preview = gr.Image(
                                         label="Source PDF Preview",
-                                        file_types=[".pdf"],
-                                        height=480,
+                                        height=600,
                                         show_label=False,
-                                        container=False
+                                        container=False,
+                                        type="numpy"
                                     )
                                 with gr.Tab("Translated"):
-                                    trans_preview = gr.File(
+                                    trans_preview = gr.Image(
                                         label="Translated PDF Preview",
-                                        file_types=[".pdf"],
-                                        height=480,
+                                        height=600,
                                         show_label=False,
-                                        container=False
+                                        container=False,
+                                        type="numpy"
                                     )
                                 with gr.Tab("Text Preview"):
                                     translation_preview = gr.Textbox(
@@ -2445,8 +2497,10 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                 pdf_path = str(Path(pdf_path).resolve())  # Convert to absolute path
                 self.source_pdf_path = pdf_path
                 count = self.get_page_count(pdf)
-                # Return source PDF for source_preview, None for trans_preview (not translated yet)
-                return pdf_path, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}", gr.update(visible=False, value="")
+                # Render first page as image for preview
+                source_img = self.render_pdf_page(pdf_path, 0)
+                # Return source PDF image, None for translated (not translated yet)
+                return source_img, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}", gr.update(visible=False, value="")
             
             # URL download
             def on_url_load(url):
@@ -2459,10 +2513,12 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                     # Store source PDF path (ensure absolute path)
                     pdf_path = str(Path(pdf_path).resolve())  # Convert to absolute path
                     self.source_pdf_path = pdf_path
-                    # Create a file-like object for Gradio
+                    # Get page count
                     count = self.get_page_count(type('obj', (object,), {'name': pdf_path})())
-                    # Return source PDF for source_preview, None for trans_preview
-                    return pdf_path, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}", gr.update(visible=True, value=status_msg)
+                    # Render first page as image
+                    source_img = self.render_pdf_page(pdf_path, 0)
+                    # Return source PDF image, None for translated
+                    return source_img, None, gr.update(maximum=max(1, count), value=1), f"of {max(1, count)}", gr.update(visible=True, value=status_msg)
                 else:
                     self.source_pdf_path = None
                     return None, None, gr.update(maximum=1, value=1), "of 1", gr.update(visible=True, value=status_msg)
@@ -2488,8 +2544,12 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                     max_p = 1
                 new_p = max(1, min(max_p, int(page) + direction))
                 
-                # Return source PDF for source_preview, translated PDF for trans_preview
-                return source_path, trans_path, new_p
+                # Render PDF pages as images (0-indexed, so subtract 1)
+                source_img = self.render_pdf_page(source_path, new_p - 1) if source_path else None
+                trans_img = self.render_pdf_page(trans_path, new_p - 1) if trans_path else None
+                
+                # Return source PDF image, translated PDF image, and new page number
+                return source_img, trans_img, new_p
             
             page_prev.click(
                 fn=lambda p, pg, t: nav_page(p, pg, t, -1),
@@ -2547,7 +2607,7 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
             def clear_all():
                 self.translated_pdf_path = None
                 self.source_pdf_path = None
-                return "", gr.update(value=None, visible=False), "", None, "of 1", gr.update(maximum=1, value=1), None, "", ""
+                return "", gr.update(value=None, visible=False), "", None, "of 1", gr.update(maximum=1, value=1), None, "", ""  # None for images
             
             clear_btn.click(fn=clear_all, outputs=translate_outputs)
             
