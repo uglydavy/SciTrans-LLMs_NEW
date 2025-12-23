@@ -1,8 +1,11 @@
-"""PDF parsing and text extraction."""
+"""PDF parsing and text extraction using best available methods."""
 
 from pathlib import Path
 from typing import List, Dict, Optional
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     import fitz  # PyMuPDF
@@ -20,13 +23,35 @@ from ..core.models import Document, Block, BoundingBox, BlockType
 
 
 class PDFParser:
-    """Extract text and layout from PDF files."""
+    """
+    Extract text and layout from PDF files using best available methods.
     
-    def __init__(self, use_ocr: bool = False):
+    Uses:
+    - PyMuPDF (mandatory) for text extraction and basic layout
+    - PyMuPDF find_tables() for table detection (best available)
+    - YOLO layout detection (if available) for advanced layout analysis
+    - Heuristic methods as fallback
+    """
+    
+    def __init__(self, use_ocr: bool = False, use_yolo: bool = True):
         if not HAS_PYMUPDF:
             raise ImportError("PyMuPDF not installed. Run: pip install PyMuPDF")
         
         self.use_ocr = use_ocr
+        self.use_yolo = use_yolo
+        
+        # Try to load YOLO if requested and available
+        self.yolo_model = None
+        if self.use_yolo:
+            try:
+                from .yolo import load_yolo_model
+                self.yolo_model = load_yolo_model()
+                if self.yolo_model:
+                    logger.info("YOLO layout detection enabled - using best available extraction methods")
+                else:
+                    logger.info("YOLO not available - using PyMuPDF + heuristics (still robust)")
+            except Exception as e:
+                logger.debug(f"YOLO not available: {e} - using PyMuPDF + heuristics")
     
     def parse(
         self,
@@ -94,16 +119,25 @@ class PDFParser:
         return document
     
     def _detect_protected_zones(self, page) -> Dict[str, List]:
-        """Detect protected zones (tables, figures, images) on a page.
+        """
+        Detect protected zones (tables, figures, images) on a page.
+        
+        Uses best available methods:
+        1. PyMuPDF find_tables() - BEST for table detection (mandatory)
+        2. YOLO layout detection (if available) - BEST for layout analysis
+        3. PyMuPDF image/drawing detection - BEST for figure detection
+        4. Heuristic fallback
         
         Returns:
             Dict with 'table_zones', 'image_zones', 'drawing_zones' as lists of fitz.Rect
         """
+        import fitz
         table_zones = []
         image_zones = []
         drawing_zones = []
         
-        # 1. TABLE DETECTION using PyMuPDF's find_tables()
+        # 1. TABLE DETECTION using PyMuPDF's find_tables() - BEST AVAILABLE METHOD
+        # This is mandatory and uses PyMuPDF's advanced table detection
         try:
             tables = page.find_tables()
             if tables:
@@ -112,9 +146,63 @@ class PDFParser:
                         table_rect = fitz.Rect(table.bbox)
                         if not table_rect.is_empty and table_rect.get_area() > 100:
                             table_zones.append(table_rect)
+                            logger.debug(f"Detected table zone: {table_rect}")
+        except AttributeError:
+            # find_tables might not be available in older PyMuPDF versions
+            logger.warning("PyMuPDF find_tables() not available - using heuristic table detection")
         except Exception as e:
-            # find_tables might not be available in all PyMuPDF versions
-            pass
+            logger.debug(f"Table detection error: {e}")
+        
+        # 1.5. YOLO-based layout detection (if available) - ENHANCES table/figure detection
+        if self.yolo_model:
+            try:
+                # Render page to image for YOLO
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for better detection
+                img_array = pix.tobytes("ppm")
+                
+                # Convert to numpy array (YOLO expects this format)
+                import numpy as np
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(img_array))
+                img_array = np.array(img)
+                
+                from .yolo import detect_layout_elements
+                detections = detect_layout_elements(self.yolo_model, img_array)
+                
+                # Map YOLO detections to zones
+                page_rect = page.rect
+                for i, (box, score, class_name) in enumerate(zip(
+                    detections.get('boxes', []),
+                    detections.get('scores', []),
+                    detections.get('class_names', [])
+                )):
+                    if score < 0.5:  # Confidence threshold
+                        continue
+                    
+                    # Convert YOLO box (xyxy) to fitz.Rect
+                    # YOLO boxes are normalized or in pixel coordinates
+                    x0, y0, x1, y1 = box
+                    # Scale if needed (YOLO might return normalized coords)
+                    if x1 <= 1.0 and y1 <= 1.0:
+                        x0 *= page_rect.width
+                        y0 *= page_rect.height
+                        x1 *= page_rect.width
+                        y1 *= page_rect.height
+                    
+                    rect = fitz.Rect(x0, y0, x1, y1)
+                    
+                    # Map class to zone type
+                    class_lower = class_name.lower() if class_name else ""
+                    if 'table' in class_lower and rect.get_area() > 100:
+                        table_zones.append(rect)
+                        logger.debug(f"YOLO detected table: {rect}")
+                    elif 'figure' in class_lower or 'image' in class_lower:
+                        if rect.get_area() > 100:
+                            image_zones.append(rect)
+                            logger.debug(f"YOLO detected figure: {rect}")
+            except Exception as e:
+                logger.debug(f"YOLO detection failed: {e} - continuing with PyMuPDF methods")
         
         # 2. IMAGE DETECTION
         try:
@@ -215,7 +303,7 @@ class PDFParser:
         
         return clusters
     
-    def _compute_ink_bbox(self, block_data: Dict, page) -> Optional[fitz.Rect]:
+    def _compute_ink_bbox(self, block_data: Dict, page):
         """Compute tight bbox from non-whitespace span bboxes.
         
         Args:

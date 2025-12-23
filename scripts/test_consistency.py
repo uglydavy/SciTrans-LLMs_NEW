@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Debug logging setup
 DEBUG_LOG_PATH = Path("/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log")
 
-def debug_log(session_id: str, run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]):
+def debug_log(session_id, run_id, hypothesis_id, location, message, data):
     """Write debug log entry."""
     try:
         log_entry = {
@@ -42,19 +42,19 @@ def debug_log(session_id: str, run_id: str, hypothesis_id: str, location: str, m
         with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
     except Exception as e:
-        logger.debug(f"Failed to write debug log: {e}")
+        logger.debug("Failed to write debug log: %s", e)
 
 
 class ConsistencyTester:
     """Test translation consistency across multiple runs."""
     
-    def __init__(self, config: PipelineConfig, num_runs: int = 3):
+    def __init__(self, config, num_runs=3):
         self.config = config
         self.num_runs = num_runs
-        self.results: List[Dict[str, Any]] = []
-        self.inconsistencies: List[Dict[str, Any]] = []
+        self.results = []
+        self.inconsistencies = []
     
-    def test_pdf(self, pdf_path: Path) -> Dict[str, Any]:
+    def test_pdf(self, pdf_path):
         """Test consistency of translating a single PDF."""
         logger.info(f"Testing consistency for: {pdf_path.name}")
         
@@ -183,7 +183,7 @@ class ConsistencyTester:
         analysis = self._analyze_consistency()
         return analysis
     
-    def _analyze_consistency(self) -> Dict[str, Any]:
+    def _analyze_consistency(self):
         """Analyze results for inconsistencies."""
         if len(self.results) < 2:
             return {"error": "Need at least 2 runs to check consistency"}
@@ -238,7 +238,7 @@ class ConsistencyTester:
             }
         }
     
-    def _check_translation_consistency(self, runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _check_translation_consistency(self, runs):
         """Check if translations are identical across runs."""
         inconsistencies = []
         
@@ -263,7 +263,7 @@ class ConsistencyTester:
         
         return inconsistencies
     
-    def _check_masking_consistency(self, runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _check_masking_consistency(self, runs):
         """Check if masking is consistent across runs."""
         inconsistencies = []
         
@@ -292,7 +292,7 @@ class ConsistencyTester:
         
         return inconsistencies
     
-    def _check_order_consistency(self, runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _check_order_consistency(self, runs):
         """Check if block processing order is consistent."""
         inconsistencies = []
         
@@ -304,13 +304,13 @@ class ConsistencyTester:
                 inconsistencies.append({
                     "type": "order_diff",
                     "run_1": first_order,
-                    f"run_{i+1}": order,
+                    "run_{}".format(i+1): order,
                     "difference": "Order differs"
                 })
         
         return inconsistencies
     
-    def _check_coverage_consistency(self, runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _check_coverage_consistency(self, runs):
         """Check if coverage is consistent."""
         inconsistencies = []
         
@@ -325,7 +325,7 @@ class ConsistencyTester:
         
         return inconsistencies
     
-    def generate_report(self, output_path: Path) -> None:
+    def generate_report(self, output_path):
         """Generate consistency test report."""
         report = {
             "test_date": datetime.now().isoformat(),
