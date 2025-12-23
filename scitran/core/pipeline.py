@@ -38,7 +38,8 @@ class PipelineConfig:
     target_lang: str = "fr"
     
     # Translation backend
-    backend: str = "openai"  # openai, anthropic, deepseek, ollama, free
+    # DEFAULT: deepseek (best quality/price ratio)
+    backend: str = "deepseek"  # deepseek, openai, anthropic, ollama, free
     model_name: Optional[str] = None  # Specific model to use
     api_key: Optional[str] = None
     
@@ -82,7 +83,7 @@ class PipelineConfig:
     max_translation_retries: int = 3  # Retry failed blocks this many times
     retry_backoff_factor: float = 2.0  # Exponential backoff multiplier
     enable_fallback_backend: bool = True  # Escalate to stronger backend on failure
-    fallback_backend: str = "openai"  # Backend to use for failed blocks
+    fallback_backend: str = "openai"  # Backend to use for failed blocks (openai is strongest fallback)
     detect_identity_translation: bool = True  # Treat source==output as failure
     
     # Prompt settings
@@ -107,6 +108,7 @@ class PipelineConfig:
     adaptive_concurrency: bool = True  # Adjust concurrency based on backend
     
     # Fast mode (PHASE 1.3): Optimized for speed over quality
+    # DISABLED BY DEFAULT: Quality over speed is the priority
     fast_mode: bool = False  # When True: num_candidates=1, no reranking, no context, higher concurrency
     
     # Output settings
@@ -500,20 +502,26 @@ class TranslationPipeline:
     def _can_use_batch_translation(self, total_blocks: int = 0) -> bool:
         """Check if batch translation is available for current backend.
         
-        Batch mode is faster because it:
-        - Uses async concurrent requests
-        - Has built-in caching
-        - Deduplicates identical texts
+        QUALITY OVER SPEED: Batch mode is disabled by default.
+        Sequential mode provides:
+        - Multi-candidate generation
+        - Reranking for best quality
+        - Context-aware translation
+        - Better error handling
         
-        For free/cascade/huggingface backends, ALWAYS use batch mode (they don't benefit
-        from multi-candidate reranking anyway - their outputs are deterministic).
+        Batch mode is only used for free backends that don't support quality features.
         """
-        simple_backends = {'cascade', 'free', 'huggingface', 'libre', 'argos', 'mymemory'}
+        # Disable batch mode by default - quality over speed
+        if self.config.fast_mode:
+            # Fast mode enabled: use batch for speed
+            return True
         
-        # ALWAYS use batch mode for free backends (faster + they're deterministic)
+        # Only use batch for simple free backends that don't benefit from reranking
+        simple_backends = {'cascade', 'free', 'libre', 'argos'}
         if self.config.backend.lower() in simple_backends:
             return True
         
+        # For quality backends (deepseek, openai, anthropic), use sequential for better quality
         return False
     
     def _retry_failed_blocks(self, document: Document, block_ids: List[str]) -> None:
@@ -1358,80 +1366,124 @@ Provide only the refined translation, with no explanations."""
         return True
     
     def _translate_blocks_batch(self, document: Document):
-        """Translate blocks using optimized fast async batch processing."""
-        from scitran.utils.fast_translator import FastTranslator
-        import os
+        """
+        Translate blocks using async batch processing with configured backend.
         
-        # Adaptive concurrency based on document size and backend
-        total_blocks = len(document.translatable_blocks)
-        backend = self.config.backend.lower()
-        
-        # Calculate optimal concurrency
-        if self.config.adaptive_concurrency:
-            # Base concurrency on backend capabilities
-            if backend in {'cascade', 'free'}:
-                # Free backends: moderate concurrency to avoid rate limits
-                base_concurrent = 8  # Increased for speed
-            elif backend in {'openai', 'anthropic', 'deepseek'}:
-                # Paid APIs: higher concurrency (they handle it well)
-                base_concurrent = 10
-            elif backend in {'ollama', 'huggingface'}:
-                # Local/self-hosted: depends on resources
-                base_concurrent = 4
-            else:
-                base_concurrent = 6
-            
-            # Scale with document size (but cap at reasonable limit)
-            if total_blocks > 100:
-                max_concurrent = min(base_concurrent * 2, 20)  # Cap at 20
-            elif total_blocks > 50:
-                max_concurrent = min(base_concurrent * 1.5, 15)  # Cap at 15
-            else:
-                max_concurrent = base_concurrent
-            
-            # Override with config if set
-            if self.config.max_workers:
-                max_concurrent = min(max_concurrent, self.config.max_workers)
-        else:
-            # Use fixed concurrency
-            max_concurrent = 5 if backend in {'cascade', 'free'} else 8
-            if self.config.max_workers:
-                max_concurrent = self.config.max_workers
-        
-        # Optimize rate limit delay based on caching effectiveness
-        # If we have good cache hit rate, we can reduce delays
-        rate_limit_delay = 0.2 if backend in {'cascade', 'free'} else 0.1
-        
-        fast_translator = FastTranslator(
-            max_concurrent=int(max_concurrent),
-            cache_dir=str(self.config.cache_dir) if self.config.cache_dir else ".cache/translations",
-            timeout=self.config.timeout,
-            retry_count=self.config.max_retries,
-            rate_limit_delay=rate_limit_delay
-        )
+        FIXED: Now uses the actual configured translator backend instead of free services.
+        """
+        import asyncio
+        from scitran.translation.base import TranslationRequest
         
         blocks = document.translatable_blocks
         total_blocks = len(blocks)
         
+        if not self.translator:
+            raise ValueError("No translator configured - cannot proceed with batch translation")
+        
         self._report_progress(0.2, f"Batch translating {total_blocks} blocks...")
         
-        def progress_callback(completed: int, total: int):
-            progress = 0.2 + (0.6 * completed / max(total, 1))
-            self._report_progress(progress, f"Fast mode: {completed}/{total} blocks")
+        # Calculate optimal concurrency
+        backend = self.config.backend.lower()
+        if self.config.adaptive_concurrency:
+            if backend in {'cascade', 'free'}:
+                base_concurrent = 5  # Lower for free backends (rate limits)
+            elif backend in {'openai', 'anthropic', 'deepseek'}:
+                base_concurrent = 10  # Higher for paid APIs
+            else:
+                base_concurrent = 6
+            max_concurrent = min(base_concurrent, self.config.max_workers or base_concurrent)
+        else:
+            max_concurrent = self.config.max_workers or 5
         
-        # Get texts to translate
-        texts = []
+        # Build translation requests
+        requests = []
         for block in blocks:
             text = block.masked_text or block.source_text
-            texts.append(text)
+            if not text or not text.strip():
+                continue
+            
+            # Build proper translation request with system prompt
+            system_prompt = None
+            if self.prompt_optimizer:
+                context = self._get_block_context(document, block)
+                system_prompt, _ = self.prompt_optimizer.generate_prompt(
+                    block=block,
+                    template_name=self.config.prompt_template,
+                    source_lang=self.config.source_lang,
+                    target_lang=self.config.target_lang,
+                    glossary_terms=self.glossary,
+                    context=context
+                )
+            
+            request = TranslationRequest(
+                text=text,
+                source_lang=self.config.source_lang,
+                target_lang=self.config.target_lang,
+                system_prompt=system_prompt,
+                temperature=self.config.temperature if hasattr(self.config, 'temperature') else 0.0,
+                num_candidates=1,
+                glossary=self.glossary if self.config.enable_glossary else None
+            )
+            requests.append((block, request))
         
-        # Fast batch translate (async + caching + deduplication)
-        translations = fast_translator.translate_batch_sync(
-            texts=texts,
-            source_lang=self.config.source_lang,
-            target_lang=self.config.target_lang,
-            progress_callback=progress_callback
-        )
+        # Async batch translation with progress reporting
+        def progress_callback(completed: int, total: int):
+            progress = 0.2 + (0.6 * completed / max(total, 1))
+            self._report_progress(progress, f"Translating: {completed}/{total} blocks")
+        
+        async def translate_batch():
+            semaphore = asyncio.Semaphore(max_concurrent)
+            results = {}
+            
+            async def translate_one(block, req):
+                async with semaphore:
+                    try:
+                        # Most backends use sync - run in executor to avoid blocking
+                        loop = asyncio.get_event_loop()
+                        if hasattr(self.translator, 'translate'):
+                            # Backend has async support
+                            response = await self.translator.translate(req)
+                        else:
+                            # Backend only has sync - run in executor
+                            response = await loop.run_in_executor(
+                                None, 
+                                self.translator.translate_sync, 
+                                req
+                            )
+                        
+                        if response.translations and response.translations[0]:
+                            translation = response.translations[0]
+                            # Clean output
+                            translation = self._postprocess_translation(translation)
+                            results[block.block_id] = translation
+                            
+                            # Report progress
+                            completed = sum(1 for r in results.values() if r is not None)
+                            progress_callback(completed, len(requests))
+                        else:
+                            results[block.block_id] = None
+                    except Exception as e:
+                        logger.error(f"Batch translation failed for {block.block_id}: {e}")
+                        results[block.block_id] = None
+            
+            # Run all translations concurrently
+            await asyncio.gather(*[translate_one(block, req) for block, req in requests])
+            return results
+        
+        # Run async batch
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        translations_dict = loop.run_until_complete(translate_batch())
+        
+        # Apply translations to blocks
+        translations = []
+        for block in blocks:
+            translation = translations_dict.get(block.block_id)
+            translations.append(translation)
         
         # Apply translations with fallback for any missing results
         failed_block_ids = []
@@ -1486,15 +1538,9 @@ Provide only the refined translation, with no explanations."""
             )
             self._retry_failed_blocks(document, failed_block_ids)
         
-        # Store fast translator stats
-        fast_stats = fast_translator.get_stats()
-        self.stats['batch_cache_hits'] = fast_stats.get('cached', 0)
-        self.stats['batch_translated'] = fast_stats.get('translated', 0)
-        self.stats['batch_deduplicated'] = fast_stats.get('deduplicated', 0)
-        
-        cached = fast_stats.get('cached', 0)
-        translated = fast_stats.get('translated', 0)
-        self._report_progress(0.8, f"Done: {cached} cached, {translated} new translations")
+        # Report completion
+        succeeded = sum(1 for b in blocks if b.translated_text)
+        self._report_progress(0.8, f"Done: {succeeded}/{total_blocks} blocks translated")
     
     def _translate_blocks_sequential(self, document: Document):
         """Translate blocks sequentially with caching support."""
