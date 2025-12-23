@@ -62,8 +62,12 @@ class SystemEvaluator:
         
         # Run translation
         try:
-            result = self.pipeline.translate_document(str(pdf_path))
-            document = result.document
+            # Parse PDF first
+            document = self.parser.parse(str(pdf_path))
+            
+            # Then translate
+            result = self.pipeline.translate_document(document)
+            document = result.document  # Get translated document
         except Exception as e:
             logger.error(f"Translation failed: {e}")
             return {

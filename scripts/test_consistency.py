@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scitran.core.pipeline import TranslationPipeline, PipelineConfig
 from scitran.core.models import Document, Block
+from scitran.extraction.pdf_parser import PDFParser
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -76,9 +77,14 @@ class ConsistencyTester:
             # #endregion
             
             try:
+                # Parse PDF first
+                parser = PDFParser()
+                document = parser.parse(str(pdf_path))
+                
+                # Then translate
                 pipeline = TranslationPipeline(config=self.config)
-                result = pipeline.translate_document(str(pdf_path))
-                document = result.document
+                result = pipeline.translate_document(document)
+                document = result.document  # Get translated document
                 
                 # Extract block translations
                 block_translations = {}
