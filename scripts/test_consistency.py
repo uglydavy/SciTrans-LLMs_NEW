@@ -77,12 +77,74 @@ class ConsistencyTester:
             # #endregion
             
             try:
+                # #region agent log
+                debug_log(
+                    session_id=session_id,
+                    run_id=f"run_{run_id}",
+                    hypothesis_id="H11",
+                    location="test_consistency.py:test_pdf",
+                    message="Before PDF parsing",
+                    data={
+                        "pdf_path": str(pdf_path),
+                        "pdf_path_type": type(pdf_path).__name__,
+                        "pdf_exists": Path(pdf_path).exists() if hasattr(Path(pdf_path), 'exists') else "unknown"
+                    }
+                )
+                # #endregion
+                
                 # Parse PDF first
                 parser = PDFParser()
+                
+                # #region agent log
+                debug_log(
+                    session_id=session_id,
+                    run_id=f"run_{run_id}",
+                    hypothesis_id="H12",
+                    location="test_consistency.py:test_pdf",
+                    message="After PDFParser creation",
+                    data={
+                        "parser_type": type(parser).__name__,
+                        "has_parse_method": hasattr(parser, 'parse')
+                    }
+                )
+                # #endregion
+                
                 document = parser.parse(str(pdf_path))
+                
+                # #region agent log
+                debug_log(
+                    session_id=session_id,
+                    run_id=f"run_{run_id}",
+                    hypothesis_id="H13",
+                    location="test_consistency.py:test_pdf",
+                    message="After PDF parsing",
+                    data={
+                        "document_type": type(document).__name__,
+                        "has_document_id": hasattr(document, 'document_id') if document else False,
+                        "document_id": getattr(document, 'document_id', None) if document else None,
+                        "is_document": isinstance(document, Document) if 'Document' in str(type(document)) else False
+                    }
+                )
+                # #endregion
                 
                 # Then translate
                 pipeline = TranslationPipeline(config=self.config)
+                
+                # #region agent log
+                debug_log(
+                    session_id=session_id,
+                    run_id=f"run_{run_id}",
+                    hypothesis_id="H14",
+                    location="test_consistency.py:test_pdf",
+                    message="Before translate_document",
+                    data={
+                        "document_type": type(document).__name__,
+                        "document_id": getattr(document, 'document_id', None) if hasattr(document, 'document_id') else "NO_ATTR",
+                        "pipeline_type": type(pipeline).__name__
+                    }
+                )
+                # #endregion
+                
                 result = pipeline.translate_document(document)
                 document = result.document  # Get translated document
                 
@@ -380,9 +442,12 @@ def main():
     if args.temperature is not None:
         config.temperature = args.temperature
     
-    # Clear debug log
-    if DEBUG_LOG_PATH.exists():
-        DEBUG_LOG_PATH.unlink()
+    # Clear debug log (try to clear, but don't fail if permission denied)
+    try:
+        if DEBUG_LOG_PATH.exists():
+            DEBUG_LOG_PATH.unlink()
+    except PermissionError:
+        pass  # Continue even if we can't delete the log file
     
     # Run test
     tester = ConsistencyTester(config, num_runs=args.num_runs)

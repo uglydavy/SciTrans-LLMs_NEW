@@ -275,6 +275,29 @@ class TranslationPipeline:
         # Keep a reference for batch heuristics
         self.document = document
         
+        # #region agent log
+        DEBUG_LOG_PATH = Path("/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log")
+        try:
+            log_entry = {
+                "sessionId": "pipeline_debug",
+                "runId": "translate_document_entry",
+                "hypothesisId": "H15",
+                "location": "pipeline.py:translate_document",
+                "message": "translate_document entry",
+                "data": {
+                    "document_type": type(document).__name__,
+                    "is_document": isinstance(document, Document),
+                    "has_document_id": hasattr(document, 'document_id') if document else False,
+                    "document_id": getattr(document, 'document_id', None) if hasattr(document, 'document_id') else "NO_ATTR"
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        
         # Initialize result
         result = TranslationResult(
             document=document,
@@ -287,6 +310,27 @@ class TranslationPipeline:
             run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
             artifact_dir = self.config.artifact_dir or Path(f"artifacts/{run_id}")
             artifacts = ArtifactGenerator(run_id, artifact_dir)
+            
+            # #region agent log
+            try:
+                log_entry = {
+                    "sessionId": "pipeline_debug",
+                    "runId": "before_artifacts_log",
+                    "hypothesisId": "H16",
+                    "location": "pipeline.py:translate_document",
+                    "message": "Before artifacts.log",
+                    "data": {
+                        "document_type": type(document).__name__,
+                        "document_id": getattr(document, 'document_id', None) if hasattr(document, 'document_id') else "NO_ATTR"
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+                with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
+            # #endregion
+            
             artifacts.log(f"Starting translation: {document.document_id}")
         
         try:

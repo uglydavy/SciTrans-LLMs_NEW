@@ -33,7 +33,10 @@ sacrebleu>=2.3.0
 sacremoses>=0.0.53
 
 # Document Layout Detection (optional)
-# Uncomment if using YOLO
+# NOTE: ultralytics requires PyTorch, which currently only supports Python 3.9-3.12
+# If using Python 3.13+, ultralytics cannot be installed until PyTorch adds support
+# The system works fine without it - it falls back to PyMuPDF + heuristic detection
+# Uncomment ONLY if using Python 3.9-3.12:
 # ultralytics>=8.0.0
 # opencv-python>=4.8.0
 
