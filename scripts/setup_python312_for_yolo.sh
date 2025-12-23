@@ -47,11 +47,12 @@ pip install --upgrade pip
 
 echo ""
 echo "Installing ultralytics and dependencies..."
-pip install ultralytics opencv-python
+echo "Note: Using compatible versions (numpy<2, opencv-python<4.9) for PyTorch compatibility"
+pip install "numpy<2" "opencv-python<4.9" ultralytics
 
 echo ""
 echo "Verifying installation..."
-python -c "from ultralytics import YOLO; import torch; print(f'✓ ultralytics: {YOLO.__version__ if hasattr(YOLO, \"__version__\") else \"OK\"}'); print(f'✓ PyTorch: {torch.__version__}')"
+$VENV_DIR/bin/python3 -c "from ultralytics import YOLO; import torch; import numpy as np; print('✓ ultralytics: OK'); print(f'✓ PyTorch: {torch.__version__}'); print(f'✓ NumPy: {np.__version__}')"
 
 echo ""
 echo "=========================================="
