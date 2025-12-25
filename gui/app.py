@@ -633,6 +633,27 @@ class SciTransGUI:
             if cache_hits > 0:
                 status += f"\nCache: {cache_hits} hits ({cache_hit_rate:.1f}% hit rate)"
             
+            # Add scoring information if available
+            score_text = ""
+            if hasattr(result, 'score_report') and result.score_report:
+                score_report = result.score_report
+                score_text = "\n\n📊 Translation Quality Scores:\n"
+                score_text += f"• Overall: {score_report.avg_overall:.1%}\n"
+                score_text += f"• Fluency: {score_report.avg_fluency:.1%}\n"
+                score_text += f"• Adequacy: {score_report.avg_adequacy:.1%}\n"
+                score_text += f"• Glossary: {score_report.avg_glossary:.1%}\n"
+                score_text += f"• Format: {score_report.avg_format:.1%}\n"
+                score_text += f"• Numeric: {score_report.avg_numeric:.1%}\n"
+                score_text += f"\nQuality Distribution:\n"
+                score_text += f"• High (≥0.8): {score_report.high_quality_blocks} blocks\n"
+                score_text += f"• Medium (0.5-0.8): {score_report.medium_quality_blocks} blocks\n"
+                score_text += f"• Low (<0.5): {score_report.low_quality_blocks} blocks\n"
+                if score_report.issues:
+                    high_severity_issues = [i for i in score_report.issues if i.get('severity') == 'high']
+                    if high_severity_issues:
+                        score_text += f"\n⚠️ {len(high_severity_issues)} high-severity issues detected"
+            status += score_text
+            
             # Performance info
             perf_text = f"Performance Metrics:\n"
             perf_text += f"• Throughput: {blocks_per_sec:.2f} blocks/second\n"
@@ -655,6 +676,38 @@ class SciTransGUI:
             source_img = self.render_pdf_page(source_path_str, 0) if source_path_str else None
             trans_img = self.render_pdf_page(translated_path_str, 0) if translated_path_str else None
             
+            # Generate score display text
+            score_display_text = ""
+            if hasattr(result, 'score_report') and result.score_report:
+                score_report = result.score_report
+                score_display_text = "📊 Translation Quality Scores\n"
+                score_display_text += "=" * 50 + "\n\n"
+                score_display_text += f"Overall Score: {score_report.avg_overall:.1%}\n\n"
+                score_display_text += "Dimension Scores:\n"
+                score_display_text += f"  • Fluency:     {score_report.avg_fluency:.1%}\n"
+                score_display_text += f"  • Adequacy:    {score_report.avg_adequacy:.1%}\n"
+                score_display_text += f"  • Glossary:    {score_report.avg_glossary:.1%}\n"
+                score_display_text += f"  • Format:      {score_report.avg_format:.1%}\n"
+                score_display_text += f"  • Numeric:     {score_report.avg_numeric:.1%}\n\n"
+                score_display_text += "Quality Distribution:\n"
+                total_translated = score_report.translated_blocks or 1
+                score_display_text += f"  • High (≥0.8):  {score_report.high_quality_blocks} blocks ({score_report.high_quality_blocks / total_translated:.1%})\n"
+                score_display_text += f"  • Medium (0.5-0.8): {score_report.medium_quality_blocks} blocks ({score_report.medium_quality_blocks / total_translated:.1%})\n"
+                score_display_text += f"  • Low (<0.5):   {score_report.low_quality_blocks} blocks ({score_report.low_quality_blocks / total_translated:.1%})\n\n"
+                if score_report.issues:
+                    high_severity = [i for i in score_report.issues if i.get('severity') == 'high']
+                    medium_severity = [i for i in score_report.issues if i.get('severity') == 'medium']
+                    score_display_text += f"Issues Detected:\n"
+                    score_display_text += f"  • High severity: {len(high_severity)}\n"
+                    score_display_text += f"  • Medium severity: {len(medium_severity)}\n"
+                    score_display_text += f"  • Total: {len(score_report.issues)}\n\n"
+                    if high_severity:
+                        score_display_text += "High Severity Issues:\n"
+                        for issue in high_severity[:5]:
+                            score_display_text += f"  ⚠️ {issue.get('message', '')[:60]}\n"
+            else:
+                score_display_text = "No scoring data available. Scores are computed automatically after translation."
+            
             return (
                 status,
                 gr.update(value=translated_path_str, visible=True, interactive=True),  # Download button gets file path
@@ -665,6 +718,7 @@ class SciTransGUI:
                 source_img,  # Return rendered image for source preview
                 perf_text,
                 translation_preview_text,
+                score_display_text,  # Score information
             )
             
         except Exception as e:
@@ -2123,6 +2177,13 @@ class SciTransGUI:
                                             show_label=False,
                                             placeholder="Performance metrics will appear here..."
                                         )
+                                    with gr.Tab("Quality Scores"):
+                                        score_info = gr.Textbox(
+                                            lines=15,
+                                            interactive=False,
+                                            show_label=False,
+                                            placeholder="Translation quality scores will appear here after translation..."
+                                        )
                         
                         # Right: Preview (wider) - Preview replaces progress/status area
                         with gr.Column(scale=3):
@@ -2702,7 +2763,7 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                 mask_custom_macros,
                 mask_apostrophes_in_latex,
             ]
-            translate_outputs = [status_box, download_btn, log_box, trans_preview, page_total, page_slider, source_preview, perf_info, translation_preview]
+            translate_outputs = [status_box, download_btn, log_box, trans_preview, page_total, page_slider, source_preview, perf_info, translation_preview, score_info]
             
             # Wrapper to add error handling and logging
             def translate_wrapper(*args):
@@ -2727,7 +2788,8 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
                         gr.update(maximum=1, value=1),
                         None,
                         f"Error: {str(e)}",
-                        f"Error: {str(e)}"
+                        f"Error: {str(e)}",
+                        "No scoring data available due to error."
                     )
             
             translate_btn.click(
@@ -2744,7 +2806,7 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
             def clear_all():
                 self.translated_pdf_path = None
                 self.source_pdf_path = None
-                return "", gr.update(value=None, visible=False), "", None, "of 1", gr.update(maximum=1, value=1), None, "", ""  # None for images
+                return "", gr.update(value=None, visible=False), "", None, "of 1", gr.update(maximum=1, value=1), None, "", "", ""  # None for images, empty score
             
             clear_btn.click(fn=clear_all, outputs=translate_outputs)
             

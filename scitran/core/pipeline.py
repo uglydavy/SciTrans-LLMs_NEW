@@ -481,6 +481,26 @@ class TranslationPipeline:
             result.blocks_translated = self.stats['blocks_succeeded']
             result.blocks_failed = self.stats['blocks_failed']
             
+            # Phase 5: Post-translation scoring
+            self._report_progress(0.95, "Evaluating translation quality...")
+            from scitran.evaluation.block_scorer import BlockScorer
+            scorer = BlockScorer(glossary_manager=self.glossary_manager)
+            score_report = scorer.score_document(document)
+            result.score_report = score_report
+            
+            # Store scores in blocks
+            for block_score in score_report.block_scores:
+                block = document.get_block_by_id(block_score.block_id)
+                if block:
+                    block.scores = {
+                        'fluency': block_score.fluency_score,
+                        'adequacy': block_score.adequacy_score,
+                        'glossary': block_score.glossary_score,
+                        'numeric': block_score.numeric_consistency,
+                        'format': block_score.format_preservation,
+                        'overall': block_score.overall_score
+                    }
+            
             # STRICT SUCCESS CRITERIA: Must pass validation
             if hasattr(result, 'validation_result') and result.validation_result:
                 # Handle both ValidationResult object and dict (defensive)

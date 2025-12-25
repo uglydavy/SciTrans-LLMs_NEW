@@ -422,6 +422,9 @@ class TranslationResult:
     masks_applied: int = 0
     masks_restored: int = 0
     
+    # Post-translation scoring
+    score_report: Optional[Any] = None  # DocumentScoreReport from block_scorer
+    
     def get_summary(self) -> Dict[str, Any]:
         """Get summary statistics."""
         return {

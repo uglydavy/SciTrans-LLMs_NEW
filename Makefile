@@ -62,24 +62,12 @@ clean:
 gui:
 	python gui/app.py
 
-quickstart:
-	python quickstart.py
-
-benchmark-speed:
-	python benchmarks/speed_test.py
-
-benchmark-quality:
-	python benchmarks/quality_test.py corpus/test
-
-ablation:
-	python experiments/ablation.py corpus/test
-
-thesis:
-	@echo "Generating thesis materials..."
-	python experiments/ablation.py corpus/test
-	@echo "✓ Thesis materials generated in results/"
-
-setup:
-	./setup.sh
+# Removed broken targets:
+# - quickstart (file doesn't exist)
+# - benchmark-speed (benchmarks/ directory doesn't exist)
+# - benchmark-quality (benchmarks/ directory doesn't exist)
+# - ablation (experiments/ directory doesn't exist)
+# - thesis (experiments/ directory doesn't exist)
+# - setup (setup.sh doesn't exist)
 
 .DEFAULT_GOAL := help

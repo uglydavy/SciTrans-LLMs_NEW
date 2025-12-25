@@ -9,6 +9,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from scitran.core.pipeline import TranslationPipeline, PipelineConfig
 from scitran.extraction.pdf_parser import PDFParser
 from scitran.rendering.pdf_renderer import PDFRenderer
+from scitran.evaluation.block_scorer import BlockScorer, DocumentScoreReport
+from scitran.translation.glossary.manager import GlossaryManager
 from .interactive import show_welcome, interactive_translate, show_help, show_backend_details
 
 app = typer.Typer(
@@ -139,6 +141,10 @@ def translate(
         # PHASE 4.2: Show comprehensive run summary
         pipeline.print_run_summary(result)
         
+        # Show scoring report if available
+        if result.score_report:
+            _display_score_report(result.score_report)
+        
         # Also show brief stats
         console.print("\n[bold green]Translation Complete![/bold green]")
         console.print(f"Output: {output}")
@@ -179,6 +185,98 @@ def info(
         
     except Exception as e:
         console.print(f"[red]Error: {str(e)}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command()
+def score(
+    input_file: Path = typer.Argument(..., help="Translated PDF or JSON document file"),
+    output: Optional[Path] = typer.Option(None, "-o", "--output", help="Output file for score report (JSON)"),
+    glossary_domains: Optional[str] = typer.Option(None, "--glossary-domains", help="Comma-separated glossary domains"),
+    detailed: bool = typer.Option(False, "--detailed", "-d", help="Show detailed per-block scores")
+):
+    """Score and evaluate a translated document."""
+    
+    if not input_file.exists():
+        console.print(f"[red]Error: File not found: {input_file}[/red]")
+        raise typer.Exit(1)
+    
+    try:
+        from scitran.core.models import Document
+        
+        # Load document
+        if input_file.suffix == ".json":
+            # Load from JSON
+            with open(input_file, 'r', encoding='utf-8') as f:
+                import json
+                doc_data = json.load(f)
+                document = Document.from_json(json.dumps(doc_data))
+        else:
+            # Parse PDF and assume it's already translated (would need translation metadata)
+            console.print("[yellow]Warning: PDF scoring requires translation metadata.[/yellow]")
+            console.print("[yellow]Please use JSON document format or run scoring after translation.[/yellow]")
+            raise typer.Exit(1)
+        
+        # Load glossary if specified
+        glossary_manager = None
+        if glossary_domains:
+            glossary_manager = GlossaryManager()
+            for domain in glossary_domains.split(','):
+                glossary_manager.load_domain(domain.strip(), "en-fr")
+        
+        # Score document
+        console.print("\n[cyan]Scoring translated document...[/cyan]")
+        scorer = BlockScorer(glossary_manager=glossary_manager)
+        score_report = scorer.score_document(document)
+        
+        # Display report
+        _display_score_report(score_report, detailed=detailed)
+        
+        # Save report if output specified
+        if output:
+            import json
+            from datetime import datetime
+            
+            report_dict = {
+                "document_id": score_report.document_id,
+                "timestamp": score_report.timestamp.isoformat(),
+                "total_blocks": score_report.total_blocks,
+                "translated_blocks": score_report.translated_blocks,
+                "failed_blocks": score_report.failed_blocks,
+                "average_scores": {
+                    "fluency": score_report.avg_fluency,
+                    "adequacy": score_report.avg_adequacy,
+                    "glossary": score_report.avg_glossary,
+                    "numeric": score_report.avg_numeric,
+                    "format": score_report.avg_format,
+                    "overall": score_report.avg_overall
+                },
+                "quality_distribution": score_report.score_distribution,
+                "issues": score_report.issues,
+                "block_scores": [
+                    {
+                        "block_id": bs.block_id,
+                        "overall_score": bs.overall_score,
+                        "fluency": bs.fluency_score,
+                        "adequacy": bs.adequacy_score,
+                        "glossary": bs.glossary_score,
+                        "numeric": bs.numeric_consistency,
+                        "format": bs.format_preservation
+                    }
+                    for bs in score_report.block_scores
+                ]
+            }
+            
+            with open(output, 'w', encoding='utf-8') as f:
+                json.dump(report_dict, f, indent=2, ensure_ascii=False)
+            
+            console.print(f"\n[green]✓ Score report saved to {output}[/green]")
+        
+    except Exception as e:
+        console.print(f"[red]Error: {str(e)}[/red]")
+        import traceback
+        if detailed:
+            console.print(traceback.format_exc())
         raise typer.Exit(1)
 
 
@@ -695,6 +793,121 @@ def _load_api_key_for_backend(backend: str) -> Optional[str]:
             pass
     
     return None
+
+
+def _display_score_report(score_report: DocumentScoreReport, detailed: bool = False):
+    """Display scoring report in a formatted way."""
+    from rich.table import Table
+    from rich.panel import Panel
+    
+    # Summary panel
+    summary_table = Table(title="Translation Quality Summary", show_header=True, header_style="bold cyan")
+    summary_table.add_column("Metric", style="cyan")
+    summary_table.add_column("Score", justify="right", style="green")
+    
+    summary_table.add_row("Total Blocks", str(score_report.total_blocks))
+    summary_table.add_row("Translated Blocks", str(score_report.translated_blocks))
+    summary_table.add_row("Failed Blocks", str(score_report.failed_blocks))
+    summary_table.add_row("", "")  # Separator
+    summary_table.add_row("Average Fluency", f"{score_report.avg_fluency:.2%}")
+    summary_table.add_row("Average Adequacy", f"{score_report.avg_adequacy:.2%}")
+    summary_table.add_row("Average Glossary", f"{score_report.avg_glossary:.2%}")
+    summary_table.add_row("Average Numeric", f"{score_report.avg_numeric:.2%}")
+    summary_table.add_row("Average Format", f"{score_report.avg_format:.2%}")
+    summary_table.add_row("", "")  # Separator
+    summary_table.add_row("[bold]Overall Score[/bold]", f"[bold]{score_report.avg_overall:.2%}[/bold]")
+    
+    console.print("\n")
+    console.print(summary_table)
+    
+    # Quality distribution
+    dist_table = Table(title="Quality Distribution", show_header=True, header_style="bold cyan")
+    dist_table.add_column("Quality Tier", style="cyan")
+    dist_table.add_column("Count", justify="right", style="green")
+    dist_table.add_column("Percentage", justify="right", style="yellow")
+    
+    total_translated = score_report.translated_blocks or 1
+    dist_table.add_row(
+        "[green]High (≥0.8)[/green]",
+        str(score_report.high_quality_blocks),
+        f"{score_report.high_quality_blocks / total_translated:.1%}"
+    )
+    dist_table.add_row(
+        "[yellow]Medium (0.5-0.8)[/yellow]",
+        str(score_report.medium_quality_blocks),
+        f"{score_report.medium_quality_blocks / total_translated:.1%}"
+    )
+    dist_table.add_row(
+        "[red]Low (<0.5)[/red]",
+        str(score_report.low_quality_blocks),
+        f"{score_report.low_quality_blocks / total_translated:.1%}"
+    )
+    
+    console.print("\n")
+    console.print(dist_table)
+    
+    # Issues
+    if score_report.issues:
+        issues_table = Table(title="Issues Detected", show_header=True, header_style="bold red")
+        issues_table.add_column("Severity", style="red")
+        issues_table.add_column("Type", style="yellow")
+        issues_table.add_column("Message", style="white")
+        
+        for issue in score_report.issues[:10]:  # Show first 10 issues
+            severity_style = {
+                "high": "[bold red]HIGH[/bold red]",
+                "medium": "[yellow]MEDIUM[/yellow]",
+                "low": "[dim]LOW[/dim]"
+            }.get(issue.get("severity", "medium"), "[yellow]MEDIUM[/yellow]")
+            
+            issues_table.add_row(
+                severity_style,
+                issue.get("type", "unknown"),
+                issue.get("message", "")[:80]
+            )
+        
+        if len(score_report.issues) > 10:
+            issues_table.add_row("", "", f"... and {len(score_report.issues) - 10} more issues")
+        
+        console.print("\n")
+        console.print(issues_table)
+    
+    # Detailed per-block scores
+    if detailed and score_report.block_scores:
+        blocks_table = Table(title="Per-Block Scores", show_header=True, header_style="bold cyan")
+        blocks_table.add_column("Block ID", style="cyan")
+        blocks_table.add_column("Overall", justify="right", style="green")
+        blocks_table.add_column("Fluency", justify="right")
+        blocks_table.add_column("Adequacy", justify="right")
+        blocks_table.add_column("Glossary", justify="right")
+        blocks_table.add_column("Numeric", justify="right")
+        blocks_table.add_column("Format", justify="right")
+        
+        # Sort by overall score (worst first)
+        sorted_blocks = sorted(score_report.block_scores, key=lambda bs: bs.overall_score)
+        
+        for bs in sorted_blocks[:20]:  # Show worst 20 blocks
+            overall_style = (
+                "[green]" if bs.overall_score >= 0.8 else
+                "[yellow]" if bs.overall_score >= 0.5 else
+                "[red]"
+            )
+            
+            blocks_table.add_row(
+                bs.block_id[:20],
+                f"{overall_style}{bs.overall_score:.2f}[/{overall_style.split('[')[1].split(']')[0]}]",
+                f"{bs.fluency_score:.2f}",
+                f"{bs.adequacy_score:.2f}",
+                f"{bs.glossary_score:.2f}",
+                f"{bs.numeric_consistency:.2f}",
+                f"{bs.format_preservation:.2f}"
+            )
+        
+        if len(sorted_blocks) > 20:
+            blocks_table.add_row("", "", "", "", "", "", f"... and {len(sorted_blocks) - 20} more blocks")
+        
+        console.print("\n")
+        console.print(blocks_table)
 
 
 def cli():
