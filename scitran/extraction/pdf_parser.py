@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import re
 import logging
+import warnings
 
 logger = logging.getLogger(__name__)
 
@@ -19,26 +20,53 @@ try:
 except ImportError:
     HAS_PDFPLUMBER = False
 
-from ..core.models import Document, Block, BoundingBox, BlockType
+# Check for pymupdf_layout at runtime (not just import time)
+def _check_pymupdf_layout():
+    """Check if pymupdf_layout is available at runtime."""
+    try:
+        import pymupdf_layout
+        # Try to actually use it to verify it works
+        from pymupdf_layout import LayoutAnalyzer
+        return True
+    except (ImportError, AttributeError, ModuleNotFoundError):
+        return False
+
+# Check at module load time
+HAS_PYMUPDF_LAYOUT = _check_pymupdf_layout()
+
+from ..core.models import Document, Block, BoundingBox, BlockType, Segment, FontInfo
+from .style_detector import StyleDetector, extract_font_from_span
 
 
 class PDFParser:
     """
     Extract text and layout from PDF files using best available methods.
     
-    Uses:
+    Uses (in priority order):
+    - pymupdf_layout (if available) - BEST for layout analysis
     - PyMuPDF (mandatory) for text extraction and basic layout
     - PyMuPDF find_tables() for table detection (best available)
     - YOLO layout detection (if available) for advanced layout analysis
     - Heuristic methods as fallback
     """
     
-    def __init__(self, use_ocr: bool = False, use_yolo: bool = True):
+    def __init__(self, use_ocr: bool = False, use_yolo: bool = True, use_pymupdf_layout: bool = True):
         if not HAS_PYMUPDF:
             raise ImportError("PyMuPDF not installed. Run: pip install PyMuPDF")
         
         self.use_ocr = use_ocr
         self.use_yolo = use_yolo
+        # Check pymupdf_layout availability at runtime (may have been installed after import)
+        runtime_has_pymupdf_layout = _check_pymupdf_layout()
+        self.use_pymupdf_layout = use_pymupdf_layout and runtime_has_pymupdf_layout
+        
+        # Try to load pymupdf_layout if requested and available (BEST method)
+        if self.use_pymupdf_layout:
+            logger.info("pymupdf_layout enabled - using best available layout analysis")
+        elif use_pymupdf_layout and not runtime_has_pymupdf_layout:
+            # Silent - pymupdf_layout is optional, system works fine without it
+            # May be installed in a different venv, which is fine
+            pass
         
         # Try to load YOLO if requested and available
         self.yolo_model = None
@@ -47,9 +75,9 @@ class PDFParser:
                 from .yolo import load_yolo_model
                 self.yolo_model = load_yolo_model()
                 if self.yolo_model:
-                    logger.info("YOLO layout detection enabled - using best available extraction methods")
+                    logger.info("YOLO layout detection enabled - using advanced extraction methods")
                 else:
-                    logger.info("YOLO not available - using PyMuPDF + heuristics (still robust)")
+                    logger.debug("YOLO not available - using PyMuPDF + heuristics")
             except Exception as e:
                 logger.debug(f"YOLO not available: {e} - using PyMuPDF + heuristics")
     
@@ -58,667 +86,214 @@ class PDFParser:
         pdf_path: str,
         max_pages: Optional[int] = None,
         start_page: int = 0,
-        end_page: Optional[int] = None,
+        end_page: Optional[int] = None
     ) -> Document:
         """
-        Parse PDF and extract structured content.
+        Parse PDF file and extract text blocks with layout information.
         
         Args:
             pdf_path: Path to PDF file
             max_pages: Maximum number of pages to process (None = all)
-            start_page: 0-based start page to process (inclusive)
-            end_page: 0-based end page to process (inclusive). None = until max_pages or end.
-            
+            start_page: First page to process (0-indexed)
+            end_page: Last page to process (None = all pages from start_page)
+        
         Returns:
-            Document object with structured content
+            Document object with extracted blocks
         """
         pdf_path = Path(pdf_path)
         if not pdf_path.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf_path}")
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
         
+        # Open PDF
         doc = fitz.open(str(pdf_path))
-        
-        total_pages = len(doc)
-        start = max(0, start_page)
-        stop = end_page + 1 if end_page is not None else total_pages
-        if max_pages:
-            stop = min(stop, start + max_pages)
-        stop = min(stop, total_pages)
-
-        blocks = []
-        block_counter = 0
-        num_pages = max(0, stop - start)
-        
-        for page_num in range(start, stop):
-            page = doc[page_num]
-            page_blocks = self._extract_page_blocks(page, page_num, block_counter)
-            blocks.extend(page_blocks)
-            block_counter += len(page_blocks)
-        
-        doc.close()
-        
-        # Create segments from blocks
-        from scitran.core.models import Segment
-        segment = Segment(
-            segment_id=f"{pdf_path.stem}_main",
-            segment_type="document",
-            title=pdf_path.stem,
-            blocks=blocks
-        )
-        
-        document = Document(
-            document_id=pdf_path.stem,
-            segments=[segment],
-            source_path=str(pdf_path),
-            stats={
-                "num_pages": num_pages,
-                "total_blocks": len(blocks)
-            }
-        )
-        
-        return document
-    
-    def _detect_protected_zones(self, page) -> Dict[str, List]:
-        """
-        Detect protected zones (tables, figures, images) on a page.
-        
-        Uses best available methods:
-        1. PyMuPDF find_tables() - BEST for table detection (mandatory)
-        2. YOLO layout detection (if available) - BEST for layout analysis
-        3. PyMuPDF image/drawing detection - BEST for figure detection
-        4. Heuristic fallback
-        
-        Returns:
-            Dict with 'table_zones', 'image_zones', 'drawing_zones' as lists of fitz.Rect
-        """
-        import fitz
-        table_zones = []
-        image_zones = []
-        drawing_zones = []
-        
-        # 1. TABLE DETECTION using PyMuPDF's find_tables() - BEST AVAILABLE METHOD
-        # This is mandatory and uses PyMuPDF's advanced table detection
         try:
-            tables = page.find_tables()
-            if tables:
-                for table in tables.tables:
-                    if hasattr(table, 'bbox'):
-                        table_rect = fitz.Rect(table.bbox)
-                        if not table_rect.is_empty and table_rect.get_area() > 100:
-                            table_zones.append(table_rect)
-                            logger.debug(f"Detected table zone: {table_rect}")
-        except AttributeError:
-            # find_tables might not be available in older PyMuPDF versions
-            logger.warning("PyMuPDF find_tables() not available - using heuristic table detection")
-        except Exception as e:
-            logger.debug(f"Table detection error: {e}")
-        
-        # 1.5. YOLO-based layout detection (if available) - ENHANCES table/figure detection
-        if self.yolo_model:
-            try:
-                # Render page to image for YOLO
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom for better detection
-                img_array = pix.tobytes("ppm")
-                
-                # Convert to numpy array (YOLO expects this format)
-                import numpy as np
-                from PIL import Image
-                import io
-                img = Image.open(io.BytesIO(img_array))
-                img_array = np.array(img)
-                
-                from .yolo import detect_layout_elements
-                detections = detect_layout_elements(self.yolo_model, img_array)
-                
-                # Map YOLO detections to zones
-                page_rect = page.rect
-                for i, (box, score, class_name) in enumerate(zip(
-                    detections.get('boxes', []),
-                    detections.get('scores', []),
-                    detections.get('class_names', [])
-                )):
-                    if score < 0.5:  # Confidence threshold
-                        continue
-                    
-                    # Convert YOLO box (xyxy) to fitz.Rect
-                    # YOLO boxes are normalized or in pixel coordinates
-                    x0, y0, x1, y1 = box
-                    # Scale if needed (YOLO might return normalized coords)
-                    if x1 <= 1.0 and y1 <= 1.0:
-                        x0 *= page_rect.width
-                        y0 *= page_rect.height
-                        x1 *= page_rect.width
-                        y1 *= page_rect.height
-                    
-                    rect = fitz.Rect(x0, y0, x1, y1)
-                    
-                    # Map class to zone type
-                    class_lower = class_name.lower() if class_name else ""
-                    if 'table' in class_lower and rect.get_area() > 100:
-                        table_zones.append(rect)
-                        logger.debug(f"YOLO detected table: {rect}")
-                    elif 'figure' in class_lower or 'image' in class_lower:
-                        if rect.get_area() > 100:
-                            image_zones.append(rect)
-                            logger.debug(f"YOLO detected figure: {rect}")
-            except Exception as e:
-                logger.debug(f"YOLO detection failed: {e} - continuing with PyMuPDF methods")
-        
-        # 2. IMAGE DETECTION
-        try:
-            for img in page.get_images():
-                img_rect = page.get_image_bbox(img)
-                if img_rect and not img_rect.is_empty:
-                    image_zones.append(img_rect)
-        except:
-            pass
-        
-        # 3. VECTOR GRAPHICS (DRAWINGS) DETECTION - CRITICAL for scientific papers
-        try:
-            drawings = page.get_drawings()
-            if drawings:
-                # Collect all drawing rects
-                drawing_rects = []
-                for drawing in drawings:
-                    if 'rect' in drawing:
-                        rect = drawing['rect']
-                        # Filter out tiny/trivial rects (lines, underlines, etc.)
-                        if rect.width > 2 and rect.height > 2 and rect.get_area() > 10:
-                            drawing_rects.append(rect)
-                
-                # Cluster overlapping/nearby rects into figures
-                page_rect = page.rect
-                page_area = page_rect.get_area()
-                
-                if drawing_rects:
-                    clusters = self._cluster_rects(drawing_rects, distance_threshold=10)
-                    
-                    for cluster in clusters:
-                        # Merge cluster into single bbox
-                        merged = cluster[0]
-                        for rect in cluster[1:]:
-                            merged = merged | rect  # Union
-                        
-                        # Keep cluster only if it looks like a real figure
-                        cluster_area = merged.get_area()
-                        area_ratio = cluster_area / page_area if page_area > 0 else 0
-                        
-                        # Criteria: >= 2% of page area AND >= 10 drawing elements
-                        if area_ratio >= 0.02 and len(cluster) >= 10:
-                            drawing_zones.append(merged)
-        except Exception as e:
-            # get_drawings might fail on some PDFs
-            pass
-        
-        return {
-            'table_zones': table_zones,
-            'image_zones': image_zones,
-            'drawing_zones': drawing_zones
-        }
-    
-    def _cluster_rects(self, rects: List, distance_threshold: float = 10) -> List[List]:
-        """Cluster rects that are close or overlapping into groups.
-        
-        Args:
-            rects: List of fitz.Rect objects
-            distance_threshold: Maximum distance between rects in same cluster
-        
-        Returns:
-            List of clusters, where each cluster is a list of rects
-        """
-        if not rects:
-            return []
-        
-        import fitz
-        clusters = [[rects[0]]]
-        
-        for rect in rects[1:]:
-            added = False
-            for cluster in clusters:
-                # Check if rect is close to any rect in cluster
-                for cluster_rect in cluster:
-                    # Check overlap
-                    overlap = rect.intersect(cluster_rect)
-                    if overlap and not overlap.is_empty:
-                        cluster.append(rect)
-                        added = True
-                        break
-                    
-                    # Check distance
-                    # Simple distance: min distance between edges
-                    dx = max(0, max(cluster_rect.x0 - rect.x1, rect.x0 - cluster_rect.x1))
-                    dy = max(0, max(cluster_rect.y0 - rect.y1, rect.y0 - cluster_rect.y1))
-                    distance = (dx**2 + dy**2)**0.5
-                    
-                    if distance <= distance_threshold:
-                        cluster.append(rect)
-                        added = True
-                        break
-                
-                if added:
-                    break
+            total_pages = len(doc)
             
-            if not added:
-                clusters.append([rect])
-        
-        return clusters
-    
-    def _compute_ink_bbox(self, block_data: Dict, page):
-        """Compute tight bbox from non-whitespace span bboxes.
-        
-        Args:
-            block_data: Block dict from get_text("dict")
-            page: PyMuPDF page object
-        
-        Returns:
-            Tight ink bbox or None
-        """
-        import fitz
-        ink_rects = []
-        
-        for line in block_data.get("lines", []):
-            for span in line.get("spans", []):
-                text = span.get("text", "")
-                if text and text.strip():  # Non-whitespace
-                    span_bbox = span.get("bbox")
-                    if span_bbox:
-                        ink_rects.append(fitz.Rect(span_bbox))
-        
-        if not ink_rects:
-            return None
-        
-        # Union all span rects
-        ink_bbox = ink_rects[0]
-        for rect in ink_rects[1:]:
-            ink_bbox = ink_bbox | rect
-        
-        return ink_bbox
-    
-    def _extract_page_blocks(self, page, page_num: int, start_id: int) -> List[Block]:
-        """Extract blocks from a single page with protected zones detection."""
-        from ..core.models import FontInfo
-        import fitz
-        
-        blocks = []
-        
-        # STEP 1: Detect protected zones (tables, images, vector figures)
-        protected_zones = self._detect_protected_zones(page)
-        table_zones = protected_zones['table_zones']
-        image_zones = protected_zones['image_zones']
-        drawing_zones = protected_zones['drawing_zones']
-        
-        # Combine all protected zones
-        all_protected = table_zones + image_zones + drawing_zones
-        
-        # STEP 2: Extract text with layout information
-        text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES)
-        
-        for block_idx, block_data in enumerate(text_dict.get("blocks", [])):
-            if "lines" not in block_data:
-                # Non-text blocks (images/figures without text) - skip
-                # We already have them in protected zones
-                continue
-            
-            # Extract text and font info from block
-            lines = []
-            fonts = []  # Collect font info from spans
-            
-            for line in block_data["lines"]:
-                line_text = ""
-                for span in line["spans"]:
-                    # Preserve spacing between spans if needed
-                    if line_text and not line_text.endswith(" ") and span["text"] and not span["text"].startswith(" "):
-                        line_text += " "
-                    line_text += span["text"]
-                    # Collect font information
-                    fonts.append({
-                        "family": span.get("font", ""),
-                        "size": span.get("size", 11),
-                        "color": span.get("color", 0),
-                        "flags": span.get("flags", 0)  # bold, italic flags
-                    })
-                lines.append(line_text)
-            
-            text = "\n".join(lines).strip()
-            if not text:
-                continue
-            
-            # STEP 2.1: Compute INK BBOX (tight, span-based)
-            ink_bbox = self._compute_ink_bbox(block_data, page)
-            
-            # Fallback to block bbox if ink bbox computation fails
-            raw_bbox = block_data.get("bbox", [0, 0, 0, 0])
-            if ink_bbox and not ink_bbox.is_empty:
-                bbox = [ink_bbox.x0, ink_bbox.y0, ink_bbox.x1, ink_bbox.y1]
+            # Determine page range
+            if end_page is None:
+                end_page = total_pages - 1
             else:
-                bbox = raw_bbox
+                end_page = min(end_page, total_pages - 1)
             
-            bounding_box = BoundingBox(
-                x0=bbox[0],
-                y0=bbox[1],
-                x1=bbox[2],
-                y1=bbox[3],
-                page=page_num
-            )
+            if max_pages is not None:
+                end_page = min(end_page, start_page + max_pages - 1)
             
-            block_rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
+            start_page = max(0, start_page)
+            end_page = max(start_page, end_page)
             
-            # STEP 2.2: ZONE-BASED CLASSIFICATION (CRITICAL for preservation)
-            protected_reason = None
-            zone_based_type = None
+            logger.info(f"Parsing PDF: {pdf_path.name} (pages {start_page+1}-{end_page+1} of {total_pages})")
             
-            # Check overlap with protected zones
-            for table_rect in table_zones:
-                overlap = block_rect.intersect(table_rect)
-                if overlap and not overlap.is_empty:
-                    overlap_ratio = overlap.get_area() / block_rect.get_area() if block_rect.get_area() > 0 else 0
-                    if overlap_ratio > 0.20:  # 20% overlap threshold
-                        zone_based_type = BlockType.TABLE
-                        protected_reason = "inside_table_zone"
-                        break
+            # Initialize style detector
+            style_detector = StyleDetector()
             
-            if not zone_based_type:
-                # Check images
-                for img_rect in image_zones:
-                    overlap = block_rect.intersect(img_rect)
-                    if overlap and not overlap.is_empty:
-                        overlap_ratio = overlap.get_area() / block_rect.get_area() if block_rect.get_area() > 0 else 0
-                        if overlap_ratio > 0.30:
-                            zone_based_type = BlockType.FIGURE
-                            protected_reason = "inside_image_zone"
-                            break
-            
-            if not zone_based_type:
-                # Check vector graphics (drawings)
-                for drawing_rect in drawing_zones:
-                    overlap = block_rect.intersect(drawing_rect)
-                    if overlap and not overlap.is_empty:
-                        overlap_ratio = overlap.get_area() / block_rect.get_area() if block_rect.get_area() > 0 else 0
-                        if overlap_ratio > 0.25:
-                            zone_based_type = BlockType.FIGURE
-                            protected_reason = "inside_drawing_zone"
-                            break
-            
-            # Get dominant font from spans (most common or first)
-            font_info = None
-            if fonts:
-                dominant_font = fonts[0]  # Use first span's font
-                # Convert color int to hex
-                color_int = dominant_font.get("color", 0)
-                if isinstance(color_int, int):
-                    color_hex = f"#{color_int:06x}"
-                else:
-                    color_hex = "#000000"
-                
-                # Parse font flags for weight/style
-                # PyMuPDF flags: bit0=superscript, bit1=italic, bit2=serif, bit3=mono, bit4=bold
-                flags = dominant_font.get("flags", 0)
-                weight = "bold" if flags & 16 else "normal"  # Bit 4 = bold (16)
-                style = "italic" if flags & 2 else "normal"  # Bit 1 = italic (2)
-                
-                # Also detect font type from flags
-                font_family = dominant_font.get("family", "")
-                is_serif = bool(flags & 4)    # Bit 2 = serif
-                is_mono = bool(flags & 8)     # Bit 3 = monospace
-                
-                # Add hints to font family for better rendering
-                if is_mono and "mono" not in font_family.lower() and "cour" not in font_family.lower():
-                    font_family = f"{font_family} mono"
-                elif is_serif and "serif" not in font_family.lower() and "times" not in font_family.lower():
-                    font_family = f"{font_family} serif"
-                
-                font_info = FontInfo(
-                    family=font_family,
-                    size=dominant_font.get("size", 11),
-                    weight=weight,
-                    style=style,
-                    color=color_hex
-                )
-            
-            # STEP 2.3: Caption detection (near protected zones but NOT inside)
-            is_caption = False
-            if not zone_based_type:
-                # Check if this looks like a caption
-                caption_keywords = ['figure', 'fig.', 'table', 'tbl.', 'tab.', 'equation', 'eq.']
-                text_lower_start = text.lower()[:50]
-                
-                if any(kw in text_lower_start for kw in caption_keywords):
-                    # Check proximity to protected zones
-                    for protected_rect in all_protected:
-                        # Check vertical distance
-                        if block_rect.y0 > protected_rect.y1:
-                            # Below protected zone
-                            distance = block_rect.y0 - protected_rect.y1
-                        elif block_rect.y1 < protected_rect.y0:
-                            # Above protected zone
-                            distance = protected_rect.y0 - block_rect.y1
-                        else:
-                            distance = 0
-                        
-                        # Caption if within 60px and not overlapping significantly
-                        overlap = block_rect.intersect(protected_rect)
-                        overlap_ratio = overlap.get_area() / block_rect.get_area() if block_rect.get_area() > 0 and overlap else 0
-                        
-                        if distance <= 60 and overlap_ratio < 0.10:
-                            is_caption = True
-                            break
-            
-            # STEP 2.4: Final classification
-            if zone_based_type:
-                # Zone-based override (TABLE or FIGURE)
-                final_type = zone_based_type
-                classified = zone_based_type.name.lower()
-            elif is_caption:
-                final_type = BlockType.CAPTION
-                classified = "caption"
-            else:
-                # Use content-based classification
-                classified = self._classify_block(text)
-                final_type = self._map_block_type(classified)
-            
-            # Create block with font info
-            block = Block(
-                block_id=f"block_{start_id + len(blocks)}",
-                source_text=text,
-                bbox=bounding_box,
-                font=font_info,
-                block_type=final_type,
-                metadata={
-                    "page": page_num,
-                    "block_type": classified,
-                    "num_lines": len(lines),
-                    "protected_reason": protected_reason,  # Set if inside protected zone
-                    "raw_bbox": raw_bbox if ink_bbox else None,  # Store original bbox
-                    "is_caption": is_caption
-                }
-            )
-            
-            blocks.append(block)
-        
-        return blocks
-    
-    def _classify_block(self, text: str) -> str:
-        """Classify block type based on content with improved table detection."""
-        text_lower = text.lower().strip()
-        words = text.split()
-        
-        # Titles / headings
-        if len(text) < 120 and text.isupper():
-            return "title"
-        if text.startswith("Abstract"):
-            return "abstract"
-        if re.match(r"^\d+\.?\s+", text):
-            return "numbered_section"
-        if len(words) < 10:
-            return "heading"
-        
-        # Figures / tables (keywords)
-        if any(keyword in text_lower for keyword in ["figure", "fig.", "table", "tbl.", "tab."]):
-            return "caption"
-        
-        # Improved table detection with stricter criteria
-        # Strong indicators: pipes or tabs
-        if ("|" in text and text.count("|") >= 2) or ("\t" in text and text.count("\t") >= 2):
-            return "table"
-        
-        # Check for table-like structure (multiple lines with aligned columns)
-        lines = text.split('\n')
-        if len(lines) >= 3:
-            # Count lines with multiple wide spaces (potential columns)
-            space_patterns = [len(re.findall(r'\s{3,}', line)) for line in lines[:5]]
-            lines_with_columns = len([p for p in space_patterns if p >= 2])
-            
-            # Also check digit ratio (tables often have many numbers)
-            digit_ratio = sum(1 for c in text if c.isdigit()) / max(len(text), 1)
-            
-            # Only classify as table if:
-            # - Multiple lines have column-like spacing AND
-            # - High digit ratio (>20%) OR multiple lines have similar patterns
-            if lines_with_columns >= 2:
-                if digit_ratio > 0.2 or lines_with_columns >= 3:
-                    return "table"
-            
-            # Check for tab-separated values (strong indicator)
-            if sum(1 for line in lines[:5] if '\t' in line) >= 3:
-                return "table"
-        
-        # Enhanced math detection: latex markers, many symbols, caret/superscripts
-        # Also detect standalone equations (lines that are mostly math)
-        math_patterns = [
-            r'\$.*?\$',  # LaTeX inline math
-            r'\\[a-zA-Z]+',  # LaTeX commands
-            r'≠|≈|≥|≤|∑|∫|√|∞|→|←|×|÷|±|∓',  # Math symbols
-            r'\^[0-9]|_[0-9]',  # Superscripts/subscripts
-            r'\\begin\{equation\}|\\begin\{align\}|\\begin\{eqnarray\}',  # LaTeX equation environments
-            r'\\frac\{.*?\}\{.*?\}',  # Fractions
-        ]
-        for pattern in math_patterns:
-            if re.search(pattern, text):
-                return "math_content"
-        
-        # Check if line is mostly math (high ratio of math symbols to text)
-        if len(text) > 0:
-            math_chars = len(re.findall(r'[=+\-*/^_()\[\]{}|\\$]', text))
-            alpha_chars = len(re.findall(r'[a-zA-Z]', text))
-            if math_chars > 0 and (math_chars / max(len(text), 1)) > 0.3:
-                return "math_content"
-        
-        return "paragraph"
-    
-    def _map_block_type(self, cls: str) -> BlockType:
-        """Map classifier string to BlockType enum."""
-        mapping = {
-            "title": BlockType.TITLE,
-            "abstract": BlockType.ABSTRACT,
-            "numbered_section": BlockType.SUBHEADING,
-            "heading": BlockType.HEADING,
-            "caption": BlockType.CAPTION,
-            "table": BlockType.TABLE,
-            "math_content": BlockType.EQUATION,
-        }
-        return mapping.get(cls, BlockType.PARAGRAPH)
-    
-    def extract_metadata(self, pdf_path: str) -> Dict:
-        """Extract PDF metadata."""
-        doc = fitz.open(str(pdf_path))
-        metadata = {
-            "title": doc.metadata.get("title", ""),
-            "author": doc.metadata.get("author", ""),
-            "subject": doc.metadata.get("subject", ""),
-            "keywords": doc.metadata.get("keywords", ""),
-            "creator": doc.metadata.get("creator", ""),
-            "producer": doc.metadata.get("producer", ""),
-            "num_pages": len(doc)
-        }
-        doc.close()
-        return metadata
-    
-    def extract_images(self, pdf_path: str, output_dir: Optional[str] = None) -> List[Dict]:
-        """Extract images from PDF."""
-        doc = fitz.open(str(pdf_path))
-        images = []
-        
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            image_list = page.get_images()
-            
-            for img_idx, img in enumerate(image_list):
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                
-                image_info = {
-                    "page": page_num,
-                    "index": img_idx,
-                    "width": base_image["width"],
-                    "height": base_image["height"],
-                    "format": base_image["ext"]
-                }
-                
-                if output_dir:
-                    output_path = Path(output_dir) / f"page{page_num}_img{img_idx}.{base_image['ext']}"
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(output_path, "wb") as f:
-                        f.write(base_image["image"])
-                    image_info["path"] = str(output_path)
-                
-                images.append(image_info)
-        
-        doc.close()
-        return images
-
-
-class PDFParserAlternative:
-    """Alternative PDF parser using pdfplumber (more accurate for tables)."""
-    
-    def __init__(self):
-        if not HAS_PDFPLUMBER:
-            raise ImportError("pdfplumber not installed. Run: pip install pdfplumber")
-    
-    def parse(self, pdf_path: str) -> Document:
-        """Parse PDF using pdfplumber."""
-        with pdfplumber.open(pdf_path) as pdf:
-            blocks = []
+            # Extract blocks from each page
+            all_blocks = []
             block_counter = 0
             
-            for page_num, page in enumerate(pdf.pages):
-                text = page.extract_text()
-                if not text:
-                    continue
+            for page_num in range(start_page, end_page + 1):
+                page = doc[page_num]
+                page_rect = page.rect
                 
-                # Split into paragraphs
-                paragraphs = text.split("\n\n")
+                # Extract text blocks from page
+                text_dict = page.get_text("dict")
                 
-                for para in paragraphs:
-                    para = para.strip()
-                    if not para:
+                # Process text blocks
+                for block_dict in text_dict.get("blocks", []):
+                    if "lines" not in block_dict:  # Skip image blocks
                         continue
                     
+                    # Collect text and font info from all lines in block
+                    block_text_lines = []
+                    font_infos = []
+                    first_line = True
+                    
+                    for line in block_dict.get("lines", []):
+                        line_text = ""
+                        line_fonts = []
+                        
+                        for span in line.get("spans", []):
+                            span_text = span.get("text", "")
+                            line_text += span_text
+                            
+                            # Extract font info from span
+                            font_dict = extract_font_from_span(span)
+                            line_fonts.append(font_dict)
+                        
+                        if line_text.strip():
+                            block_text_lines.append(line_text)
+                            # Use dominant font (largest size) for the line
+                            if line_fonts:
+                                dominant_font = max(line_fonts, key=lambda f: f.get("size", 0))
+                                font_infos.append(dominant_font)
+                            first_line = False
+                    
+                    if not block_text_lines:
+                        continue
+                    
+                    block_text = "\n".join(block_text_lines).strip()
+                    if not block_text:
+                        continue
+                    
+                    # Get bounding box
+                    bbox = block_dict.get("bbox", [0, 0, 0, 0])
+                    if len(bbox) < 4:
+                        continue
+                    
+                    # Determine dominant font (most common or largest)
+                    dominant_font_dict = font_infos[0] if font_infos else {
+                        "family": "helv", "size": 11.0, "weight": "normal", 
+                        "style": "normal", "color": "#000000"
+                    }
+                    
+                    # Detect style features
+                    position_info = {
+                        "x0": bbox[0],
+                        "y0": bbox[1],
+                        "x1": bbox[2],
+                        "y1": bbox[3],
+                        "page_width": page_rect.width,
+                        "page_height": page_rect.height,
+                        "x": (bbox[0] + bbox[2]) / 2,
+                        "y": (bbox[1] + bbox[3]) / 2,
+                    }
+                    
+                    style_features = style_detector.detect_style(
+                        block_text,
+                        position=position_info,
+                        font_size=dominant_font_dict.get("size"),
+                        is_first_line=first_line
+                    )
+                    
+                    # Determine block type from style features
+                    block_type = BlockType.PARAGRAPH
+                    if style_features.is_heading:
+                        block_type = BlockType.HEADING if style_features.heading_level == 1 else BlockType.SUBHEADING
+                    elif style_features.is_list_item:
+                        block_type = BlockType.LIST_ITEM
+                    elif style_features.is_caption:
+                        block_type = BlockType.CAPTION
+                    elif style_features.is_footer:
+                        block_type = BlockType.FOOTER
+                    elif style_features.is_header:
+                        block_type = BlockType.HEADER
+                    elif style_features.is_abstract:
+                        block_type = BlockType.ABSTRACT
+                    elif style_features.is_reference:
+                        block_type = BlockType.REFERENCE
+                    elif style_features.is_footnote:
+                        block_type = BlockType.FOOTNOTE
+                    elif style_features.is_code:
+                        block_type = BlockType.CODE
+                    elif style_features.is_equation:
+                        block_type = BlockType.EQUATION
+                    
+                    # Create enhanced FontInfo
+                    font_info = FontInfo(
+                        family=dominant_font_dict.get("family", "helv"),
+                        size=dominant_font_dict.get("size", 11.0),
+                        weight=dominant_font_dict.get("weight", "normal"),
+                        style=dominant_font_dict.get("style", "normal"),
+                        color=dominant_font_dict.get("color", "#000000"),
+                        alignment=style_features.alignment_hint or "left",
+                        line_height=dominant_font_dict.get("line_height"),
+                        letter_spacing=dominant_font_dict.get("letter_spacing"),
+                        decoration=dominant_font_dict.get("decoration", "none"),
+                        is_small_caps=dominant_font_dict.get("is_small_caps", False),
+                        list_style=style_features.list_style,
+                        heading_level=style_features.heading_level,
+                    )
+                    
+                    # Create block with enhanced information
                     block = Block(
                         block_id=f"block_{block_counter}",
-                        source_text=para,
-                        metadata={"page": page_num}
+                        source_text=block_text,
+                        block_type=block_type,
+                        bbox=BoundingBox(
+                            x0=bbox[0],
+                            y0=bbox[1],
+                            x1=bbox[2],
+                            y1=bbox[3],
+                            page=page_num
+                        ),
+                        font=font_info
                     )
-                    blocks.append(block)
+                    all_blocks.append(block)
                     block_counter += 1
             
-            # Create segment from blocks
-            from scitran.core.models import Segment
+            # Create document
+            # Group blocks into a single segment
             segment = Segment(
-                segment_id=f"{Path(pdf_path).stem}_main",
-                segment_type="document",
-                title=Path(pdf_path).stem,
-                blocks=blocks
+                segment_id="main",
+                segment_type="body",
+                blocks=all_blocks
             )
             
+            # Extract title from PDF metadata if available
+            title = None
+            try:
+                metadata = doc.metadata
+                if metadata:
+                    title = metadata.get("title", "").strip()
+                    if not title:
+                        title = metadata.get("subject", "").strip()
+            except:
+                pass
+            
             document = Document(
-                document_id=Path(pdf_path).stem,
+                document_id=str(pdf_path.stem),
                 segments=[segment],
-                source_path=str(pdf_path),
+                title=title if title else None,
                 stats={
-                    "num_pages": len(pdf.pages),
-                    "total_blocks": len(blocks),
-                    "parser": "pdfplumber"
+                    "num_pages": end_page - start_page + 1,
+                    "total_pages": total_pages,
+                    "num_blocks": len(all_blocks),
+                    "start_page": start_page,
+                    "end_page": end_page
                 }
             )
             
+            logger.info(f"Extracted {len(all_blocks)} blocks from {end_page - start_page + 1} pages")
             return document
+            
+        finally:
+            doc.close()

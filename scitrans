@@ -11,25 +11,58 @@ while [ -h "$SOURCE" ]; do
 done
 SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" &> /dev/null && pwd )"
 
-VENV_DIR="$SCRIPT_DIR/.venv"
+# Try .venv312 first (for ultralytics/Python 3.12), fall back to .venv
+if [ -f "$SCRIPT_DIR/.venv312/bin/python3" ]; then
+    VENV_DIR="$SCRIPT_DIR/.venv312"
+elif [ -f "$SCRIPT_DIR/.venv/bin/python3" ]; then
+    VENV_DIR="$SCRIPT_DIR/.venv"
+else
+    echo "Virtual environment not found. Please create one:"
+    echo "  For Python 3.12 (with ultralytics): python3.12 -m venv .venv312 && .venv312/bin/pip install -e ."
+    echo "  For Python 3.13: python3 -m venv .venv && .venv/bin/pip install -e ."
+    exit 1
+fi
+
 PYTHON="$VENV_DIR/bin/python3"
 
 # Check if venv exists
 if [ ! -f "$PYTHON" ]; then
     echo "Virtual environment not found at $VENV_DIR"
-    echo "Please run: cd $SCRIPT_DIR && python3 -m venv .venv && .venv/bin/pip install -r requirements-core.txt gradio PyMuPDF"
+    echo "Please run: cd $SCRIPT_DIR && pip install -e ."
     exit 1
 fi
 
 # Run the appropriate command
 case "$1" in
     gui)
-        echo "Launching SciTrans GUI at http://localhost:7860"
+        # Parse port argument if provided
+        PORT=7860
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --port)
+                    PORT="$2"
+                    shift 2
+                    ;;
+                *)
+                    shift
+                    ;;
+            esac
+        done
+        
+        # Set environment variables for Apple Silicon compatibility
+        export POLARS_SKIP_CPU_CHECK=1  # Skip Polars CPU check (running under Rosetta)
+        export PYTORCH_ENABLE_MPS_FALLBACK=1  # Enable CPU fallback for unsupported MPS ops
+        
+        # Suppress PyTorch MPS warnings (expected behavior on Apple Silicon)
+        export PYTHONWARNINGS="ignore::UserWarning:torch.*"
+        
+        echo "Launching SciTrans GUI on port $PORT..."
         exec "$PYTHON" -c "
 import sys
 sys.path.insert(0, '$SCRIPT_DIR')
 from gui.app import launch
-launch()
+launch(port=$PORT)
 "
         ;;
     help|--help|-h)

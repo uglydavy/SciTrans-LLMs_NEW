@@ -65,13 +65,26 @@ class BoundingBox:
 
 @dataclass
 class FontInfo:
-    """Font information for style preservation."""
+    """Enhanced font information for style preservation."""
     family: str
     size: float
-    weight: str = "normal"  # normal, bold
-    style: str = "normal"   # normal, italic
+    weight: str = "normal"  # normal, bold, light, medium, semibold, extrabold
+    style: str = "normal"   # normal, italic, oblique
     color: str = "#000000"  # RGB hex
     alignment: str = "left"  # left, center, right, justify (inferred from position)
+    # Enhanced styling attributes
+    line_height: Optional[float] = None  # Line spacing multiplier (e.g., 1.2, 1.5)
+    letter_spacing: Optional[float] = None  # Character spacing in points
+    word_spacing: Optional[float] = None  # Word spacing in points
+    decoration: str = "none"  # none, underline, strikethrough, overline
+    # Text formatting
+    is_small_caps: bool = False  # Small caps variant
+    is_all_caps: bool = False  # All uppercase
+    # List formatting (for LIST_ITEM blocks)
+    list_style: Optional[str] = None  # bullet, number, letter, roman
+    list_indent: Optional[float] = None  # Indentation level
+    # Heading hierarchy (for HEADING blocks)
+    heading_level: Optional[int] = None  # 1-6 for H1-H6
 
 
 @dataclass

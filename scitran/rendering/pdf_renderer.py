@@ -67,8 +67,8 @@ class PDFRenderer:
         font_files: Optional[List[str]] = None,
         font_priority: Optional[List[str]] = None,
         # PHASE 3.2: Overflow handling
-        overflow_strategy: str = "shrink",  # "shrink", "expand", "append_pages", "marker+append_pages"
-        min_font_size: float = 4.0,  # Minimum font size when shrinking
+        overflow_strategy: str = "smart",  # "smart", "shrink", "expand", "append_pages", "marker+append_pages"
+        min_font_size: float = 8.0,  # Minimum readable font size (never shrink below this)
         min_lineheight: float = 0.95,  # Minimum line height multiplier
         # STEP 7: Font resolution for non-Latin scripts
         target_lang: Optional[str] = None,  # Target language for font resolution
@@ -279,6 +279,60 @@ class PDFRenderer:
         # For unknown fonts, return with style flags
         return base_font, is_bold, is_italic
     
+    def _get_unicode_font(self, base_fontname: str, is_bold: bool, is_italic: bool) -> Optional[str]:
+        """
+        Get a Unicode-capable font for special characters (apostrophes, accents, etc.).
+        Base14 fonts don't support Unicode properly, so we need to use system fonts.
+        
+        Returns:
+            Font name string that PyMuPDF can use, or None if not available
+        """
+        import platform
+        
+        # Try to register a Unicode-capable font from system
+        # Common Unicode fonts: Times New Roman, Arial, Helvetica (system versions)
+        unicode_fonts = []
+        
+        if platform.system() == "Darwin":  # macOS
+            # macOS has good Unicode support in system fonts
+            if "times" in base_fontname.lower() or "tiro" in base_fontname.lower():
+                unicode_fonts = ["Times-Roman", "TimesNewRoman", "Times"]
+            else:
+                unicode_fonts = ["Helvetica", "Arial", "HelveticaNeue"]
+        elif platform.system() == "Windows":
+            if "times" in base_fontname.lower() or "tiro" in base_fontname.lower():
+                unicode_fonts = ["Times New Roman", "TimesNewRoman"]
+            else:
+                unicode_fonts = ["Arial", "Helvetica"]
+        else:  # Linux
+            if "times" in base_fontname.lower() or "tiro" in base_fontname.lower():
+                unicode_fonts = ["Liberation Serif", "Times New Roman", "DejaVu Serif"]
+            else:
+                unicode_fonts = ["Liberation Sans", "Arial", "DejaVu Sans"]
+        
+        # Try to register one of these fonts
+        for font_name in unicode_fonts:
+            try:
+                # Try to register the font if we have font_dir
+                registered = self._register_custom_font(font_name, is_bold, is_italic)
+                if registered:
+                    return registered
+            except:
+                pass
+        
+        # Fallback: try to use a font file if available
+        if self.font_dir or self.font_files:
+            try:
+                registered = self._register_custom_font(base_fontname, is_bold, is_italic)
+                if registered:
+                    return registered
+            except:
+                pass
+        
+        # If no Unicode font available, return None (will use base14 font)
+        # PyMuPDF will handle Unicode characters by falling back to glyph substitution
+        return None
+    
     def render_simple(self, document: Document, output_path: str):
         """Simple rendering without source PDF."""
         pdf = fitz.open()
@@ -371,8 +425,13 @@ class PDFRenderer:
             # STEP 2: TABLE and FIGURE are no longer automatically protected
             if block.block_type == BlockType.EQUATION:
                 continue
-            if block.metadata and block.metadata.get("protected_reason"):
-                continue
+            # Check if block is protected (handle both dict and TranslationMetadata)
+            if block.metadata:
+                if isinstance(block.metadata, dict):
+                    if block.metadata.get("protected_reason"):
+                        continue
+                elif hasattr(block.metadata, "protected_reason") and block.metadata.protected_reason:
+                    continue
             rect = fitz.Rect(
                 block.bbox.x0,
                 block.bbox.y0,
@@ -463,6 +522,34 @@ class PDFRenderer:
         logger.info(f"Skipped: {skipped_no_bbox} (no bbox), {skipped_no_translation} (no translation)")
         logger.info(f"Pages with translations: {sorted(blocks_by_page.keys())}")
         
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            # Use configurable debug log path or default to .cache
+            debug_log_dir = Path.home() / ".scitrans" / "logs"
+            debug_log_dir.mkdir(parents=True, exist_ok=True)
+            DEBUG_LOG_PATH = debug_log_dir / "debug.log"
+            log_entry = {
+                "sessionId": "translation_debug",
+                "runId": "render_pages",
+                "hypothesisId": "H2",
+                "location": "pdf_renderer.py:render_with_layout",
+                "message": "Page processing start",
+                "data": {
+                    "total_pages": total_pages_in_doc,
+                    "pages_with_blocks": sorted(blocks_by_page.keys()),
+                    "translated_count": translated_count,
+                    "skipped_no_translation": skipped_no_translation
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        
         # Process each page
         pages_processed = 0
         for page_num in range(total_pages_in_doc):
@@ -491,8 +578,8 @@ class PDFRenderer:
         
         logger.info(f"Processed {pages_processed} pages with translations out of {total_pages_in_doc} total pages")
         
-        # STEP 5: Create overflow pages if strategy is append_pages
-        if self.overflow_strategy in ["append_pages", "marker+append_pages"]:
+        # STEP 5: Create overflow pages if strategy is append_pages or smart (fallback)
+        if self.overflow_strategy in ["append_pages", "marker+append_pages", "smart"]:
             overflow_blocks = [e for e in self.overflow_report if "full_text" in e]
             if overflow_blocks:
                 logger.info(f"Creating overflow pages for {len(overflow_blocks)} blocks")
@@ -531,8 +618,40 @@ class PDFRenderer:
             logger.warning(f"Invalid rect for block {block.block_id}: {rect}")
             return
         
-        # Get font info with bold/italic
+        # Get font info with enhanced styling
         fontname, is_bold, is_italic = self._get_font_name(block.font)
+        
+        # Use enhanced font properties if available
+        line_height_multiplier = 1.2  # Default
+        if block.font and block.font.line_height:
+            line_height_multiplier = block.font.line_height
+        
+        # Get text FIRST before any Unicode checks
+        text = block.translated_text
+        if not text or not text.strip():
+            return
+        
+        # Ensure text is properly encoded as UTF-8 string (Python 3 default)
+        if isinstance(text, bytes):
+            text = text.decode('utf-8', errors='replace')
+        elif not isinstance(text, str):
+            text = str(text)
+        
+        # CRITICAL FIX: Use Unicode-capable font for special characters (apostrophes, accents)
+        # Check if text contains Unicode characters that need special font support
+        # Also check for common apostrophe characters that might be replaced
+        apostrophe_chars = ["'", "'", "'", "`", "`"]
+        has_unicode = any(ord(c) > 127 for c in text) or any(c in text for c in apostrophe_chars)
+        if has_unicode and self.download_fonts:
+            unicode_font = self._get_unicode_font(fontname, is_bold, is_italic)
+            if unicode_font:
+                fontname = unicode_font
+                logger.debug(f"Using Unicode font {fontname} for block {block.block_id} (Unicode chars detected)")
+        
+        # Normalize apostrophes - ensure they're proper Unicode apostrophes
+        # Replace common problematic apostrophes with proper ones
+        text = text.replace("'", "'")  # Replace straight apostrophe with curly
+        text = text.replace("'", "'")  # Replace right single quote with apostrophe
         
         # Detect alignment
         alignment = 0  # Default: left align (0=left, 1=center, 2=right, 3=justify)
@@ -554,14 +673,16 @@ class PDFRenderer:
             elif rect.x0 > page_width * 0.7:
                 alignment = 2  # Right
         
-        # Get font size
+        # Get font size - preserve original size for consistency
         if block.font and block.font.size and block.font.size > 0:
             fontsize = block.font.size
+            # Don't scale down too aggressively - preserve original size when possible
         else:
             bbox_height = rect.height
             num_lines = max(1, block.translated_text.count('\n') + 1)
             estimated_size = bbox_height / num_lines / 1.2
-            fontsize = max(8, min(20, estimated_size))
+            # Use a reasonable default that matches typical academic text
+            fontsize = max(10, min(12, estimated_size))  # Default to 10-12pt for readability
         
         # Get color
         color = (0, 0, 0)
@@ -573,13 +694,86 @@ class PDFRenderer:
             except:
                 pass
         
-        text = block.translated_text
-        if not text or not text.strip():
-            return
+        # Text already assigned earlier in the function, no need to reassign
+        
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            # Use configurable debug log path or default to .cache
+            debug_log_dir = Path.home() / ".scitrans" / "logs"
+            debug_log_dir.mkdir(parents=True, exist_ok=True)
+            DEBUG_LOG_PATH = debug_log_dir / "debug.log"
+            log_entry = {
+                "sessionId": "translation_debug",
+                "runId": "render_text",
+                "hypothesisId": "H1",
+                "location": "pdf_renderer.py:_insert_text_block",
+                "message": "Before text normalization",
+                "data": {
+                    "block_id": block.block_id,
+                    "page": block.bbox.page if block.bbox else None,
+                    "text_length": len(text),
+                    "has_apostrophe": "'" in text or "'" in text or "'" in text,
+                    "has_question_mark": "?" in text,
+                    "line_breaks_count": text.count('\n'),
+                    "text_preview": text[:100] if len(text) > 100 else text,
+                    "text_type": type(text).__name__
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        
+        # Normalize line breaks: replace multiple newlines with single space within paragraphs
+        # But preserve intentional paragraph breaks (double newlines)
+        import re
+        # Split by double newlines (paragraph breaks)
+        paragraphs = text.split('\n\n')
+        normalized_paragraphs = []
+        for para in paragraphs:
+            # Replace single newlines within paragraph with space
+            normalized_para = re.sub(r'\n+', ' ', para.strip())
+            normalized_paragraphs.append(normalized_para)
+        text = '\n\n'.join(normalized_paragraphs)
+        
+        # #region agent log
+        try:
+            log_entry = {
+                "sessionId": "translation_debug",
+                "runId": "render_text",
+                "hypothesisId": "H1",
+                "location": "pdf_renderer.py:_insert_text_block",
+                "message": "After text normalization",
+                "data": {
+                    "block_id": block.block_id,
+                    "text_length": len(text),
+                    "line_breaks_count": text.count('\n'),
+                    "text_preview": text[:100] if len(text) > 100 else text
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
         
         # Try inserting with progressively smaller sizes
-        line_height = 1.2 if fontsize > 12 else 1.15
-        sizes_to_try = [fontsize, fontsize * 0.95, fontsize * 0.9, fontsize * 0.85, max(self.min_font_size, fontsize * 0.75)]
+        # Use tighter line height for better text fitting
+        line_height = 1.15 if fontsize > 12 else 1.1
+        # More gradual size reduction to preserve readability
+        sizes_to_try = [
+            fontsize,  # Original size
+            fontsize * 0.95,  # 5% smaller
+            fontsize * 0.9,   # 10% smaller
+            fontsize * 0.85,  # 15% smaller
+            fontsize * 0.8,   # 20% smaller
+            max(self.min_font_size, fontsize * 0.75)  # 25% smaller or min
+        ]
         
         for size in sizes_to_try:
             try:
@@ -613,6 +807,12 @@ class PDFRenderer:
         }
         self.overflow_report.append(overflow_event)
         
+        if self.overflow_strategy == "smart":
+            # Smart strategy: Try multiple approaches in order of preference
+            success = self._smart_overflow_handling(page, rect, text, fontname, fontsize, color, alignment, line_height, block)
+            if success:
+                return  # Successfully handled overflow
+        
         if self.overflow_strategy == "shrink":
             # Force insert at minimum size (may truncate)
             try:
@@ -624,6 +824,21 @@ class PDFRenderer:
                 logger.warning(f"Forced insert at min size for {block.block_id}")
             except Exception as e:
                 logger.error(f"Failed to insert even at min size: {e}")
+                # Last resort: try with default Base14 font (always available)
+                try:
+                    # Use Base14 font that's guaranteed to exist
+                    fallback_font = "helv"  # Helvetica is always available in PyMuPDF
+                    page.insert_textbox(
+                        rect, text, fontsize=self.min_font_size,
+                        fontname=fallback_font, color=color, align=alignment,
+                        lineheight=self.min_lineheight
+                    )
+                    logger.warning(f"Inserted block {block.block_id} with fallback font '{fallback_font}'")
+                except Exception as e2:
+                    logger.error(f"Failed even with fallback font for {block.block_id}: {e2}")
+                    # Mark block as failed but don't crash
+                    overflow_event["error"] = str(e2)
+                    overflow_event["status"] = "failed"
         
         elif self.overflow_strategy == "expand":
             # Try expanding rect downward
@@ -663,6 +878,149 @@ class PDFRenderer:
         else:
             logger.error(f"Unknown overflow strategy: {self.overflow_strategy}")
     
+    def _smart_overflow_handling(
+        self, page, rect, text: str, fontname: str, fontsize: float,
+        color: Tuple[float, float, float], alignment: int, line_height: float, block: Block
+    ) -> bool:
+        """
+        Smart overflow handling: Try multiple strategies to prevent overflow.
+        
+        Returns:
+            True if overflow was successfully handled, False otherwise
+        """
+        page_height = page.rect.height
+        page_width = page.rect.width
+        
+        # Strategy 1: Try expanding downward (most common case)
+        space_below = page_height - rect.y1
+        if space_below > 20:  # At least 20pt of space below
+            # Calculate how much space we need
+            estimated_lines = len(text.split('\n')) or max(1, len(text) // 50)
+            estimated_height = estimated_lines * fontsize * line_height * 1.2
+            needed_height = estimated_height - rect.height
+            
+            if needed_height > 0 and space_below >= needed_height * 0.8:  # 80% of needed space available
+                expanded_rect = fitz.Rect(
+                    rect.x0,
+                    rect.y0,
+                    rect.x1,
+                    min(rect.y1 + needed_height * 1.2, page_height - 10)  # Add 20% buffer, leave 10pt margin
+                )
+                try:
+                    rc = page.insert_textbox(
+                        expanded_rect, text, fontsize=fontsize,
+                        fontname=fontname, color=color, align=alignment,
+                        lineheight=line_height
+                    )
+                    if rc >= 0:
+                        logger.info(f"✓ Smart overflow: Expanded downward for {block.block_id}")
+                        return True
+                except Exception as e:
+                    logger.debug(f"Downward expansion failed: {e}")
+        
+        # Strategy 2: Try expanding upward (if space available above)
+        space_above = rect.y0
+        if space_above > 20:  # At least 20pt of space above
+            estimated_lines = len(text.split('\n')) or max(1, len(text) // 50)
+            estimated_height = estimated_lines * fontsize * line_height * 1.2
+            needed_height = estimated_height - rect.height
+            
+            if needed_height > 0 and space_above >= needed_height * 0.8:
+                expanded_rect = fitz.Rect(
+                    rect.x0,
+                    max(10, rect.y0 - needed_height * 1.2),  # Expand upward, leave 10pt margin
+                    rect.x1,
+                    rect.y1
+                )
+                try:
+                    rc = page.insert_textbox(
+                        expanded_rect, text, fontsize=fontsize,
+                        fontname=fontname, color=color, align=alignment,
+                        lineheight=line_height
+                    )
+                    if rc >= 0:
+                        logger.info(f"✓ Smart overflow: Expanded upward for {block.block_id}")
+                        return True
+                except Exception as e:
+                    logger.debug(f"Upward expansion failed: {e}")
+        
+        # Strategy 3: Try expanding both directions (if space available)
+        total_available = space_above + space_below
+        if total_available > 40:  # At least 40pt total space
+            estimated_lines = len(text.split('\n')) or max(1, len(text) // 50)
+            estimated_height = estimated_lines * fontsize * line_height * 1.2
+            needed_height = estimated_height - rect.height
+            
+            if needed_height > 0 and total_available >= needed_height * 0.8:
+                # Distribute expansion proportionally
+                expand_up = min(space_above * 0.8, needed_height * 0.5)
+                expand_down = min(space_below * 0.8, needed_height * 0.5)
+                
+                expanded_rect = fitz.Rect(
+                    rect.x0,
+                    max(10, rect.y0 - expand_up),
+                    rect.x1,
+                    min(page_height - 10, rect.y1 + expand_down)
+                )
+                try:
+                    rc = page.insert_textbox(
+                        expanded_rect, text, fontsize=fontsize,
+                        fontname=fontname, color=color, align=alignment,
+                        lineheight=line_height
+                    )
+                    if rc >= 0:
+                        logger.info(f"✓ Smart overflow: Expanded both directions for {block.block_id}")
+                        return True
+                except Exception as e:
+                    logger.debug(f"Bidirectional expansion failed: {e}")
+        
+        # Strategy 4: Try slightly reducing font size (but not below readable threshold)
+        readable_size = max(8.0, fontsize * 0.85)  # Never go below 8pt
+        if readable_size >= 8.0:
+            for reduced_size in [fontsize * 0.9, fontsize * 0.85, readable_size]:
+                try:
+                    rc = page.insert_textbox(
+                        rect, text, fontsize=reduced_size,
+                        fontname=fontname, color=color, align=alignment,
+                        lineheight=line_height * 0.95  # Tighter line height
+                    )
+                    if rc >= 0:
+                        logger.info(f"✓ Smart overflow: Reduced font to {reduced_size:.1f}pt for {block.block_id}")
+                        return True
+                except Exception as e:
+                    logger.debug(f"Font reduction failed at {reduced_size}: {e}")
+                    continue
+        
+        # Strategy 5: Fall back to append_pages (preserve full text, never truncate)
+        logger.info(f"Smart overflow: Using append_pages fallback for {block.block_id}")
+        overflow_event = {
+            "block_id": block.block_id,
+            "page": block.bbox.page if block.bbox else None,
+            "text_length": len(text),
+            "strategy": "append_pages",
+            "full_text": text,
+            "fontsize": fontsize,
+            "fontname": fontname,
+            "color": color,
+        }
+        # Update the overflow event in the report
+        for i, event in enumerate(self.overflow_report):
+            if event.get("block_id") == block.block_id:
+                self.overflow_report[i] = overflow_event
+                break
+        
+        # Insert marker in original location
+        marker = f"(→ voir page suivante)"
+        try:
+            page.insert_textbox(
+                rect, marker, fontsize=fontsize * 0.7,
+                fontname=fontname, color=(0.5, 0, 0), align=alignment
+            )
+        except:
+            pass
+        
+        return True  # Handled via append_pages
+    
     def _create_overflow_pages(self, doc, overflow_blocks: List[Dict[str, Any]]):
         """
         Create additional pages for overflow text (STEP 5).
@@ -694,9 +1052,9 @@ class PDFRenderer:
             header_rect = fitz.Rect(50, 50, overflow_page.rect.width - 50, 80)
             overflow_page.insert_textbox(
                 header_rect,
-                f"Overflow from page {page_num + 1}",
+                f"Suite du texte de la page {page_num + 1}",
                 fontsize=14,
-                fontname="hebo",
+                fontname="helv",  # Fixed typo: was "hebo", should be "helv"
                 color=(0.5, 0, 0),
                 align=1  # Center
             )
@@ -882,7 +1240,16 @@ class PDFRenderer:
             for segment in document.segments:
                 for block in segment.blocks:
                     text = block.translated_text or block.source_text
-                    block_type = block.metadata.get("block_type", "paragraph") if block.metadata else "paragraph"
+                    # Get block_type from metadata (handle both dict and TranslationMetadata)
+                    if block.metadata:
+                        if isinstance(block.metadata, dict):
+                            block_type = block.metadata.get("block_type", "paragraph")
+                        elif hasattr(block.metadata, "block_type"):
+                            block_type = block.metadata.block_type or "paragraph"
+                        else:
+                            block_type = "paragraph"
+                    else:
+                        block_type = "paragraph"
                     
                     if block_type == "title":
                         f.write(f"# {text}\n\n")

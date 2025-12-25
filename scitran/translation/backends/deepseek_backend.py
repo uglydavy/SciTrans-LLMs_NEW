@@ -4,6 +4,14 @@ import os
 import time
 from typing import Optional
 
+# Fix SSL certificate issues on macOS by setting certifi path
+try:
+    import certifi
+    os.environ.setdefault('SSL_CERT_FILE', certifi.where())
+    os.environ.setdefault('REQUESTS_CA_BUNDLE', certifi.where())
+except ImportError:
+    pass
+
 try:
     from openai import OpenAI, AsyncOpenAI
     HAS_OPENAI = True
@@ -19,7 +27,8 @@ class DeepSeekBackend(TranslationBackend):
     
     supports_batch_candidates = True  # DeepSeek supports n parameter
     
-    BASE_URL = "https://api.deepseek.com"
+    # Support both official DeepSeek API and dpapi.cn proxy
+    BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://dpapi.cn")
     
     MODELS = {
         "deepseek-chat": {"cost_per_1k": 0.00014, "max_tokens": 64000},
@@ -41,9 +50,15 @@ class DeepSeekBackend(TranslationBackend):
         
         super().__init__(api_key, model)
         
-        # Initialize clients with official DeepSeek base URL
-        self.client = OpenAI(api_key=self.api_key, base_url=self.BASE_URL)
-        self.async_client = AsyncOpenAI(api_key=self.api_key, base_url=self.BASE_URL)
+        # Initialize clients with DeepSeek base URL
+        # IMPORTANT: base_url must end with /v1 for OpenAI client compatibility
+        base_url_normalized = self.BASE_URL.rstrip('/')
+        if not base_url_normalized.endswith('/v1'):
+            base_url_normalized += '/v1'
+        
+        # SSL certificates are handled by certifi import at module level
+        self.client = OpenAI(api_key=self.api_key, base_url=base_url_normalized)
+        self.async_client = AsyncOpenAI(api_key=self.api_key, base_url=base_url_normalized)
     
     def _build_messages(self, request: TranslationRequest):
         """Build messages for DeepSeek API (STEP 3: clean separation)."""
@@ -136,6 +151,12 @@ class DeepSeekBackend(TranslationBackend):
         try:
             # Use n parameter for batch candidates (single API call)
             n = max(1, request.num_candidates)
+            
+            # DEBUG: Log request details
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"DeepSeek API call: model={self.model}, base_url={self.BASE_URL}, n={n}")
+            
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -143,6 +164,13 @@ class DeepSeekBackend(TranslationBackend):
                 n=n,
                 max_tokens=4096
             )
+            
+            # DEBUG: Log response type
+            logger.debug(f"Response type: {type(response)}, hasattr choices: {hasattr(response, 'choices')}")
+            
+            # Verify response structure
+            if not hasattr(response, 'choices') or not response.choices:
+                raise RuntimeError(f"Invalid response from DeepSeek API: {type(response)} - {str(response)[:200]}")
             
             # STEP 3: Clean outputs
             raw_translations = [choice.message.content.strip() for choice in response.choices]
@@ -169,4 +197,9 @@ class DeepSeekBackend(TranslationBackend):
             )
             
         except Exception as e:
+            # Better error reporting
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"DeepSeek translation failed: {type(e).__name__}: {str(e)}")
+            logger.error(f"Request: text_len={len(request.text)}, source={request.source_lang}, target={request.target_lang}")
             raise RuntimeError(f"DeepSeek translation failed: {str(e)}")

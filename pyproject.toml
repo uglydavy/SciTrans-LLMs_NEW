@@ -7,7 +7,7 @@ name = "scitrans-llms"
 version = "2.0.0"
 description = "Advanced Scientific Document Translation with LLMs"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.13"
 license = {text = "MIT"}
 authors = [
     {name = "Your Name", email = "your.email@university.edu"}
@@ -16,10 +16,10 @@ keywords = ["translation", "nlp", "scientific", "llm", "pdf"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
@@ -133,3 +133,9 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
 ignore_missing_imports = true
+
+[tool.setuptools]
+packages = ["scitran"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.json", "*.txt"]

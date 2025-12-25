@@ -65,7 +65,13 @@ def load_yolo_model(model_path: Optional[str] = None, device: Optional[str] = No
                 if torch.cuda.is_available():
                     device = "cuda"
                 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                    device = "mps"  # Apple Silicon
+                    # MPS has limited operator support - use CPU for YOLO to avoid NMS errors
+                    # Set PYTORCH_ENABLE_MPS_FALLBACK=1 if you want to try MPS with CPU fallback
+                    import os
+                    if os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK') == '1':
+                        device = "mps"  # Apple Silicon with CPU fallback
+                    else:
+                        device = "cpu"  # Use CPU to avoid torchvision::nms MPS errors
                 else:
                     device = "cpu"
         

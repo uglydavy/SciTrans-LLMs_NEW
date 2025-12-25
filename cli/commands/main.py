@@ -26,7 +26,7 @@ def translate(
     output: Optional[Path] = typer.Option(None, "-o", "--output", help="Output file path"),
     source_lang: str = typer.Option("en", "-s", "--source", help="Source language"),
     target_lang: str = typer.Option("fr", "-t", "--target", help="Target language"),
-    backend: str = typer.Option("cascade", "-b", "--backend", help="Translation backend (cascade/free/huggingface/ollama/deepseek/openai/anthropic)"),
+    backend: str = typer.Option("deepseek", "-b", "--backend", help="Translation backend (deepseek/cascade/free/huggingface/ollama/openai/anthropic)"),
     model: Optional[str] = typer.Option(None, "-m", "--model", help="Model name (e.g., gpt-4o, claude-3-5-sonnet, llama3.1)"),
     candidates: int = typer.Option(1, "-c", "--candidates", help="Number of candidates"),
     enable_masking: bool = typer.Option(True, "--masking/--no-masking", help="Enable LaTeX masking"),

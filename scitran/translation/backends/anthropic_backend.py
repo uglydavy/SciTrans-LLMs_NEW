@@ -3,6 +3,7 @@
 import os
 import time
 import asyncio
+import logging
 from typing import Optional
 
 try:
@@ -14,30 +15,60 @@ except ImportError:
 from ..base import TranslationBackend, TranslationRequest, TranslationResponse
 from ..output_cleaner import clean_batch_outputs
 
+logger = logging.getLogger(__name__)
+
 
 class AnthropicBackend(TranslationBackend):
     """Anthropic Claude-based translation backend."""
     
     MODELS = {
-        "claude-3-5-sonnet-20241022": {"cost_per_1k": 0.003, "max_tokens": 200000},
-        "claude-3-opus-20240229": {"cost_per_1k": 0.015, "max_tokens": 200000},
-        "claude-3-sonnet-20240229": {"cost_per_1k": 0.003, "max_tokens": 200000},
-        "claude-3-haiku-20240307": {"cost_per_1k": 0.00025, "max_tokens": 200000}
+        # Claude 3.5 Sonnet (Latest & Best - Recommended)
+        "claude-3-5-sonnet-20241022": {"cost_per_1k": 0.003, "max_tokens": 200000, "quality": "best"},
+        "claude-3-5-sonnet-20240620": {"cost_per_1k": 0.003, "max_tokens": 200000, "quality": "best"},
+        
+        # Claude 3 Opus (Highest Quality, Most Expensive)
+        "claude-3-opus-20240229": {"cost_per_1k": 0.015, "max_tokens": 200000, "quality": "highest"},
+        
+        # Claude 3 Sonnet (Good Balance)
+        "claude-3-sonnet-20240229": {"cost_per_1k": 0.003, "max_tokens": 200000, "quality": "good"},
+        
+        # Claude 3 Haiku (Fastest & Cheapest)
+        "claude-3-haiku-20240307": {"cost_per_1k": 0.00025, "max_tokens": 200000, "quality": "fast"},
+        
+        # Note: Claude 4.x doesn't exist yet - 3.5 Sonnet is the latest
     }
     
-    def __init__(self, api_key: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022", base_url: Optional[str] = None):
         if not HAS_ANTHROPIC:
             raise ImportError("anthropic package not installed. Run: pip install anthropic")
         
         api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        # Support custom base URL for third-party services (e.g., api.qidianai.xyz)
+        base_url = base_url or os.getenv("ANTHROPIC_API_BASE_URL")
         super().__init__(api_key, model)
         
         if self.api_key:
-            self.client = Anthropic(api_key=self.api_key)
-            self.async_client = AsyncAnthropic(api_key=self.api_key)
+            # Initialize clients with optional custom base URL
+            client_kwargs = {"api_key": self.api_key}
+            if base_url:
+                # Fix: Remove trailing /v1 if present, Anthropic SDK adds it automatically
+                # Also handle cases where base_url already includes /v1
+                if base_url.endswith("/v1"):
+                    base_url = base_url[:-3]  # Remove /v1
+                elif base_url.endswith("/v1/"):
+                    base_url = base_url[:-4]  # Remove /v1/
+                client_kwargs["base_url"] = base_url
+                logger.info(f"Using custom Anthropic API endpoint: {base_url}")
+            
+            self.client = Anthropic(**client_kwargs)
+            self.async_client = AsyncAnthropic(**client_kwargs)
         else:
             self.client = None
             self.async_client = None
+    
+    def is_available(self) -> bool:
+        """Check if backend is available and configured."""
+        return self.api_key is not None and self.client is not None
     
     def _build_system_prompt(self, request: TranslationRequest):
         """Build system prompt for Claude (STEP 3: all instructions in system)."""

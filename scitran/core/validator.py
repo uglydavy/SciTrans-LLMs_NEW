@@ -143,8 +143,13 @@ class TranslationCompletenessValidator:
                 
                 # Check restoration metadata (set by unmask_block)
                 if hasattr(block, 'metadata') and block.metadata:
-                    restored = getattr(block.metadata, 'restored_masks', None)
-                    missing_list = getattr(block.metadata, 'missing_placeholders', [])
+                    # Handle both dict and TranslationMetadata objects
+                    if isinstance(block.metadata, dict):
+                        restored = block.metadata.get('restored_masks', None)
+                        missing_list = block.metadata.get('missing_placeholders', [])
+                    else:
+                        restored = getattr(block.metadata, 'restored_masks', None)
+                        missing_list = getattr(block.metadata, 'missing_placeholders', [])
                     
                     if restored is not None:
                         # Use restoration metadata

@@ -51,6 +51,9 @@ class SciTransGUI:
             try:
                 with open(self.config_file) as f:
                     self.config = json.load(f)
+                # Ensure default_backend is set to deepseek if missing or invalid
+                if "default_backend" not in self.config or self.config["default_backend"] not in ["cascade", "free", "ollama", "openai", "anthropic", "deepseek", "local", "libre", "argos", "huggingface"]:
+                    self.config["default_backend"] = "deepseek"
             except:
                 self.config = self._default_config()
         else:
@@ -201,18 +204,12 @@ class SciTransGUI:
         def add_log(msg):
             timestamp = datetime.now().strftime("%H:%M:%S")
             logs.append(f"[{timestamp}] {msg}")
-        if pdf_file is None:
-            return (
-                "Please upload a PDF file",
-                gr.update(value=None, visible=False),
-                "",
-                None,
-                "of 0",
-                gr.update(maximum=1, value=1),
-                None,
-                "",
-                "No preview available - please upload a PDF file first."
-            )
+            # Also print to console for debugging
+            print(f"[GUI] {timestamp} {msg}")
+        
+        # CRITICAL: Log function entry for debugging
+        add_log("🚀 translate_document() called")
+        add_log(f"Parameters: pdf_file={pdf_file is not None}, backend={backend}, source={source_lang}, target={target_lang}")
         
         # Parse advanced options
         enable_masking = "Masking" in advanced_options
@@ -220,30 +217,39 @@ class SciTransGUI:
         use_context = "Context" in advanced_options
         use_glossary = "Glossary" in advanced_options
         
+        add_log(f"Advanced options: masking={enable_masking}, reranking={enable_reranking}, context={use_context}, glossary={use_glossary}")
+        
         # logs and add_log are already defined at function start (lines 157-158)
         
         try:
+            add_log("✅ Entered try block - starting translation process")
             # Handle both file uploads and URL-downloaded PDFs
+            # CRITICAL FIX: Check self.source_pdf_path if pdf_file is None (URL-loaded PDFs)
             if pdf_file is None:
-                return (
-                    "❌ Error: No PDF file provided",
-                    gr.update(visible=False),
-                    "Please upload a PDF file or provide a URL.",
-                    None,
-                    "of 0",
-                    gr.update(maximum=1, value=1),
-                    None,
-                    "",
-                    ""
-                )
-            
-            # Get PDF path - handle both file objects and string paths
-            if isinstance(pdf_file, str):
-                input_path = pdf_file  # Already a path (from URL download)
-            elif hasattr(pdf_file, 'name'):
-                input_path = pdf_file.name  # File upload object
+                # Check if we have a URL-loaded PDF stored
+                if hasattr(self, 'source_pdf_path') and self.source_pdf_path:
+                    input_path = self.source_pdf_path
+                    add_log(f"Using URL-loaded PDF: {Path(input_path).name}")
+                else:
+                    return (
+                        "❌ Error: No PDF file provided",
+                        gr.update(visible=False),
+                        "Please upload a PDF file or provide a URL.",
+                        None,
+                        "of 0",
+                        gr.update(maximum=1, value=1),
+                        None,
+                        "",
+                        ""
+                    )
             else:
-                input_path = str(pdf_file)
+                # Get PDF path - handle both file objects and string paths
+                if isinstance(pdf_file, str):
+                    input_path = pdf_file  # Already a path (from URL download)
+                elif hasattr(pdf_file, 'name'):
+                    input_path = pdf_file.name  # File upload object
+                else:
+                    input_path = str(pdf_file)
             
             from scitran.extraction.pdf_parser import PDFParser
             from scitran.core.pipeline import TranslationPipeline, PipelineConfig
@@ -285,14 +291,24 @@ class SciTransGUI:
 
             document = parser.parse(
                 str(input_path),
-                max_pages=None,
+                max_pages=None,  # Process all pages (respecting start_page/end_page)
                 start_page=start_page_val if start_page_val is not None else 0,
-                end_page=end_page_val,
+                end_page=end_page_val,  # None means process all pages from start_page
             )
             total_blocks = len(document.translatable_blocks)
             num_pages = document.stats.get("num_pages", 0)
             add_log(f"Parsed {num_pages} pages")
             add_log(f"Found {total_blocks} text blocks")
+            
+            # Log page-by-page block counts for debugging
+            blocks_by_page = {}
+            for seg in document.segments:
+                for block in seg.blocks:
+                    if block.bbox:
+                        page = block.bbox.page
+                        blocks_by_page[page] = blocks_by_page.get(page, 0) + 1
+            for page, count in sorted(blocks_by_page.items()):
+                add_log(f"  Page {page + 1}: {count} blocks")
             
             # Log blocks per page for debugging
             blocks_per_page = {}
@@ -424,9 +440,17 @@ class SciTransGUI:
             
             progress(0.15, desc="Starting translation...")
             add_log("Starting translation with caching enabled...")
+            add_log(f"Calling pipeline.translate_document() with {total_blocks} blocks...")
             
             # Translate with progress updates
-            result = pipeline.translate_document(document, progress_callback=pipeline_progress)
+            try:
+                result = pipeline.translate_document(document, progress_callback=pipeline_progress)
+                add_log(f"✅ Translation completed: {result.blocks_translated} blocks translated")
+            except Exception as trans_error:
+                add_log(f"❌ Translation failed: {str(trans_error)}")
+                import traceback
+                add_log(f"Traceback: {traceback.format_exc()}")
+                raise  # Re-raise to be caught by outer exception handler
 
             # Update preview with loading state during translation
             # (The actual preview will be updated after rendering)
@@ -518,8 +542,8 @@ class SciTransGUI:
                 font_dir=font_dir if font_dir else None,
                 font_files=[f.strip() for f in font_files.split(",") if f.strip()] if font_files else None,
                 font_priority=[p.strip().lower() for p in font_priority.split(",") if p.strip()] if font_priority else None,
-                overflow_strategy="shrink",  # PHASE 3.2: Default to shrink for GUI
-                min_font_size=4.0,
+                overflow_strategy="smart",  # Smart overflow handling: expand boxes, split text, append pages (never shrink)
+                min_font_size=8.0,  # Minimum readable font size (never shrink below this)
                 target_lang=target_lang,  # STEP 7: Enable font resolution for non-Latin scripts
                 download_fonts=True  # STEP 7: Download fonts if missing
             )
@@ -579,11 +603,33 @@ class SciTransGUI:
             cache_hits = stats.get('batch_cache_hits', 0) + stats.get('cache_hits', 0)
             cache_hit_rate = (cache_hits / total_blocks * 100) if total_blocks > 0 else 0
             
+            # Calculate visual metrics (if both PDFs exist)
+            visual_metrics_text = ""
+            try:
+                from scitran.evaluation.visual_metrics import compute_visual_similarity, render_pdf_page_to_image
+                source_img = render_pdf_page_to_image(str(input_path), 0)
+                translated_img = render_pdf_page_to_image(str(temp_output_path), 0)
+                if source_img is not None and translated_img is not None:
+                    visual_sim = compute_visual_similarity(source_img, translated_img)
+                    if visual_sim.get("structural_similarity") is not None:
+                        visual_metrics_text = f"\nVisual Similarity: {visual_sim['structural_similarity']:.2%}"
+                        add_log(f"Visual SSIM: {visual_sim['structural_similarity']:.2%}")
+            except Exception as e:
+                logger.debug(f"Visual metrics calculation failed: {e}")
+            
+            # Calculate coverage and quality metrics
+            coverage = result.coverage if hasattr(result, 'coverage') else (result.blocks_translated / total_blocks if total_blocks > 0 else 0.0)
+            overflow_count = len(renderer.overflow_report) if hasattr(renderer, 'overflow_report') else 0
+            
             status = f"✓ Translation Complete\n"
-            status += f"Blocks: {result.blocks_translated}/{total_blocks}\n"
+            status += f"Blocks: {result.blocks_translated}/{total_blocks} ({coverage:.1%} coverage)\n"
             status += f"Time: {result.duration:.1f}s ({elapsed:.1f}s total)\n"
             status += f"Speed: {blocks_per_sec:.1f} blocks/sec\n"
             status += f"Backend: {backend}"
+            if overflow_count > 0:
+                status += f"\nOverflow events: {overflow_count}"
+            if visual_metrics_text:
+                status += visual_metrics_text
             if cache_hits > 0:
                 status += f"\nCache: {cache_hits} hits ({cache_hit_rate:.1f}% hit rate)"
             
@@ -1368,65 +1414,122 @@ class SciTransGUI:
             return {v: k for k, v in en_fr.items()}
         return en_fr
     
-    def load_glossary_domain(self, domain, direction="en-fr"):
-        """Load glossary by domain (SPRINT 3: Using GlossaryManager)."""
-        if not hasattr(self, 'glossary_manager'):
-            from scitran.translation.glossary.manager import GlossaryManager
-            self.glossary_manager = GlossaryManager()
+    def load_glossary_domain(self, domain, direction="en-fr", progress=None):
+        """Load glossary by domain (SPRINT 3: Using GlossaryManager).
         
-        prev_count = len(self.glossary_manager)
-        count = self.glossary_manager.load_domain(domain, direction)
-        new_count = len(self.glossary_manager) - prev_count
-        
-        if count == 0:
-            # Try alternative file naming
-            alt_direction = direction.replace('-', '_')
-            count = self.glossary_manager.load_domain(domain, alt_direction)
+        Now runs in a way that doesn't block the UI thread.
+        """
+        try:
+            if progress:
+                progress(0.1, f"Loading {domain} glossary...")
+            
+            if not hasattr(self, 'glossary_manager'):
+                from scitran.translation.glossary.manager import GlossaryManager
+                self.glossary_manager = GlossaryManager()
+            
+            if progress:
+                progress(0.3, f"Parsing {domain} terms...")
+            
+            prev_count = len(self.glossary_manager)
+            count = self.glossary_manager.load_domain(domain, direction)
             new_count = len(self.glossary_manager) - prev_count
-        
-        if count == 0:
-            return f"⚠️ Could not load {domain} glossary. File may be missing or corrupted.", self.glossary
-        
-        # Update UI glossary dict
-        self.glossary = self.glossary_manager.to_dict()
-        self.save_glossary()
-        
-        return f"✓ Loaded {count} {domain.upper()} terms ({new_count} new)", self.glossary
+            
+            if count == 0:
+                # Try alternative file naming
+                alt_direction = direction.replace('-', '_')
+                count = self.glossary_manager.load_domain(domain, alt_direction)
+                new_count = len(self.glossary_manager) - prev_count
+            
+            if progress:
+                progress(0.7, "Updating glossary cache...")
+            
+            if count == 0:
+                return f"⚠️ Could not load {domain} glossary. File may be missing or corrupted.", self._get_glossary_preview()
+            
+            # Update UI glossary dict (create copy to avoid thread issues)
+            self.glossary = dict(self.glossary_manager.to_dict())
+            self.save_glossary()
+            
+            if progress:
+                progress(1.0, "Done!")
+            
+            return f"✓ Loaded {count} {domain.upper()} terms ({new_count} new)", self._get_glossary_preview()
+        except Exception as e:
+            logger.error(f"Error loading glossary domain {domain}: {e}")
+            return f"❌ Error loading {domain}: {str(e)}", self._get_glossary_preview()
     
-    def load_all_scientific_glossaries(self, direction="en-fr"):
-        """Load all scientific glossaries at once (SPRINT 3: Using GlossaryManager)."""
-        if not hasattr(self, 'glossary_manager'):
-            from scitran.translation.glossary.manager import GlossaryManager
-            self.glossary_manager = GlossaryManager()
+    def load_all_scientific_glossaries(self, direction="en-fr", progress=None):
+        """Load all scientific glossaries at once (SPRINT 3: Using GlossaryManager).
         
-        total_before = len(self.glossary_manager)
-        
-        # Load all domains
-        all_domains = ['ml', 'physics', 'biology', 'chemistry', 'cs', 'statistics', 'europarl']
-        for domain in all_domains:
-            try:
-                self.glossary_manager.load_domain(domain, direction)
-            except Exception as e:
-                logger.warning(f"Could not load {domain}: {e}")
-        
-        total_after = len(self.glossary_manager)
-        new_terms = total_after - total_before
-        
-        # Update UI glossary dict
-        self.glossary = self.glossary_manager.to_dict()
-        self.save_glossary()
-        
-        return f"✓ Loaded ALL glossaries: {total_after} total terms ({new_terms} new)", self.glossary
+        Now reports progress to prevent UI appearing frozen.
+        """
+        try:
+            if not hasattr(self, 'glossary_manager'):
+                from scitran.translation.glossary.manager import GlossaryManager
+                self.glossary_manager = GlossaryManager()
+            
+            total_before = len(self.glossary_manager)
+            
+            # Load all domains with progress
+            all_domains = ['ml', 'physics', 'biology', 'chemistry', 'cs', 'statistics', 'europarl']
+            loaded = []
+            failed = []
+            
+            for i, domain in enumerate(all_domains):
+                if progress:
+                    progress((i + 1) / len(all_domains), f"Loading {domain}...")
+                
+                try:
+                    count = self.glossary_manager.load_domain(domain, direction)
+                    if count > 0:
+                        loaded.append(domain)
+                except Exception as e:
+                    logger.warning(f"Could not load {domain}: {e}")
+                    failed.append(domain)
+            
+            total_after = len(self.glossary_manager)
+            new_terms = total_after - total_before
+            
+            # Update UI glossary dict (create copy to avoid thread issues)
+            self.glossary = dict(self.glossary_manager.to_dict())
+            self.save_glossary()
+            
+            if progress:
+                progress(1.0, "Done!")
+            
+            status = f"✓ Loaded {len(loaded)} glossaries: {total_after} total terms ({new_terms} new)"
+            if failed:
+                status += f"\n⚠️ Failed: {', '.join(failed)}"
+            
+            return status, self._get_glossary_preview()
+        except Exception as e:
+            logger.error(f"Error loading all glossaries: {e}")
+            return f"❌ Error: {str(e)}", self._get_glossary_preview()
     
-    def load_glossary_file(self, file):
-        """Load glossary from uploaded file."""
+    def _get_glossary_preview(self):
+        """Get glossary preview for UI (thread-safe)."""
+        if self.glossary:
+            return [[k, v] for k, v in list(self.glossary.items())[:50]]
+        return []
+    
+    def load_glossary_file(self, file, progress=None):
+        """Load glossary from uploaded file.
+        
+        Now reports progress for large files.
+        """
         if file is None:
-            return "No file selected", self.glossary
+            return "No file selected", self._get_glossary_preview()
         
         try:
+            if progress:
+                progress(0.2, "Reading file...")
+            
             file_path = file.name if hasattr(file, 'name') else str(file)
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            
+            if progress:
+                progress(0.5, "Processing terms...")
             
             prev_count = len(self.glossary)
             if "terms" in data:
@@ -1434,11 +1537,19 @@ class SciTransGUI:
             else:
                 self.glossary.update(data)
             
+            if progress:
+                progress(0.8, "Saving...")
+            
             new_count = len(self.glossary) - prev_count
             self.save_glossary()  # Save persistently
-            return f"✓ Loaded from file: {new_count} new terms (total: {len(self.glossary)})", self.glossary
+            
+            if progress:
+                progress(1.0, "Done!")
+            
+            return f"✓ Loaded from file: {new_count} new terms (total: {len(self.glossary)})", self._get_glossary_preview()
         except Exception as e:
-            return f"Error: {str(e)}", self.glossary
+            logger.error(f"Error loading glossary file: {e}")
+            return f"❌ Error: {str(e)}", self._get_glossary_preview()
     
     def add_glossary_term(self, source, target):
         """Add term to glossary."""
@@ -1841,7 +1952,7 @@ class SciTransGUI:
                 # TAB 1: TRANSLATION
                 # ===========================================================
                 with gr.Tab("Translation"):
-                    allowed_backends = ["cascade", "free", "ollama", "openai", "anthropic", "deepseek", "local", "libre", "argos"]
+                    allowed_backends = ["deepseek", "openai", "anthropic", "cascade", "free", "ollama", "local", "libre", "argos"]
                     initial_backend = self.config.get("default_backend", "deepseek")
                     if initial_backend not in allowed_backends:
                         initial_backend = "deepseek"
@@ -2078,9 +2189,9 @@ class SciTransGUI:
                         with gr.Column():
                             gr.Markdown("**🔌 Backend Test**")
                             test_backend_sel = gr.Dropdown(
-                                ["cascade", "free", "ollama", "openai", "anthropic", "deepseek", "local", "libre", "argos", "huggingface"],
-                                value="free", label="Backend",
-                                info="Select backend to test. Free options: cascade, free, local, libre, argos"
+                                ["deepseek", "openai", "anthropic", "cascade", "free", "ollama", "local", "libre", "argos", "huggingface"],
+                                value="deepseek", label="Backend",
+                                info="DeepSeek recommended. Free options: cascade, free, local, libre, argos"
                             )
                             # Pre-filled with rich test content
                             test_text = gr.Textbox(
@@ -2218,10 +2329,10 @@ Copy these to test different formatting:
                             gr.Markdown("### ⚙️ Translation Settings")
                             
                             set_backend = gr.Dropdown(
-                                ["cascade", "free", "ollama", "openai", "anthropic", "deepseek", "local", "libre", "argos", "huggingface"],
+                                ["deepseek", "openai", "anthropic", "cascade", "free", "ollama", "local", "libre", "argos", "huggingface"],
                                 value=self.config.get("default_backend", "deepseek"),
                                 label="Default Backend",
-                                info="Backend to use by default"
+                                info="DeepSeek recommended for best quality/price. Free options have rate limits."
                             )
                             
                             with gr.Accordion("🔧 Core Features", open=True):
@@ -2593,13 +2704,39 @@ The glossary is a dictionary of domain-specific terms that ensures consistent, a
             ]
             translate_outputs = [status_box, download_btn, log_box, trans_preview, page_total, page_slider, source_preview, perf_info, translation_preview]
             
+            # Wrapper to add error handling and logging
+            def translate_wrapper(*args):
+                """Wrapper to catch and log any errors during translation."""
+                try:
+                    print(f"[GUI DEBUG] translate_wrapper called with {len(args)} arguments")
+                    result = self.translate_document(*args)
+                    print(f"[GUI DEBUG] translate_document returned successfully")
+                    return result
+                except Exception as e:
+                    print(f"[GUI DEBUG] ERROR in translate_wrapper: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Return error state
+                    error_msg = f"❌ Translation failed: {str(e)}\n\nCheck console/logs for details."
+                    return (
+                        error_msg,
+                        gr.update(value=None, visible=False),
+                        error_msg,
+                        None,
+                        "of 0",
+                        gr.update(maximum=1, value=1),
+                        None,
+                        f"Error: {str(e)}",
+                        f"Error: {str(e)}"
+                    )
+            
             translate_btn.click(
-                fn=self.translate_document,
+                fn=translate_wrapper,
                 inputs=translate_inputs,
                 outputs=translate_outputs
             )
             retranslate_btn.click(
-                fn=self.translate_document,
+                fn=translate_wrapper,
                 inputs=translate_inputs,
                 outputs=translate_outputs
             )
@@ -2742,23 +2879,53 @@ def find_free_port(start_port=7860, max_attempts=10):
                 return port
         except OSError:
             continue
-    return start_port + max_attempts
+    # If no free port found in range, return None to let Gradio handle it
+    return None
 
 
 def launch(share=False, port=None):
     """Launch the GUI."""
     if port is None:
         port = find_free_port(7860)
+        if port is None:
+            # If no free port found, let Gradio find one automatically
+            port = 0  # 0 means "let OS assign a free port"
     
-    gui = SciTransGUI()
-    app = gui.create_interface()
-    app.launch(
-        server_name="0.0.0.0",
-        server_port=port,
-        share=share,
-        inbrowser=True,
-        allowed_paths=[str(Path(tempfile.gettempdir())), str(Path.home() / ".scitrans")]
-    )
+    # Build launch kwargs
+    launch_kwargs = {
+        "server_name": "0.0.0.0",
+        "share": share,  # Explicitly set share=False to suppress Gradio warning
+        "inbrowser": True,
+        "show_error": True,
+        "allowed_paths": [str(Path(tempfile.gettempdir())), str(Path.home() / ".scitrans")]
+    }
+    
+    # Only set server_port if we have a specific port (not 0)
+    if port and port != 0:
+        launch_kwargs["server_port"] = port
+        url = f"http://localhost:{port}"
+    else:
+        # Gradio will assign a port, we'll print it after launch
+        url = "http://localhost:<auto-assigned>"
+    
+    print(f"\n{'='*60}")
+    print(f"🚀 Starting SciTrans GUI...")
+    print(f"{'='*60}")
+    print(f"📱 GUI will be available at: {url}")
+    print(f"🌐 If browser doesn't open automatically, visit the URL shown above")
+    print(f"{'='*60}\n")
+    
+    try:
+        gui = SciTransGUI()
+        app = gui.create_interface()
+        
+        app.launch(**launch_kwargs)
+    except Exception as e:
+        print(f"\n❌ Error launching GUI: {e}")
+        print(f"Please check the error above and try again.")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":

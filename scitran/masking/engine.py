@@ -40,6 +40,11 @@ class MaskingConfig:
     mask_acronyms: bool = False
     mask_apostrophes_in_latex: bool = True  # Treat apostrophes inside math as part of math
     mask_custom_macros: bool = True  # Broader macro handling
+    # Enhanced masking options
+    mask_toc_page_numbers: bool = True  # Page numbers in TOC (e.g., "... 5")
+    mask_figure_table_refs: bool = True  # References like "Figure 1.1", "Table 2"
+    mask_page_refs: bool = True  # Page references like "see page 5", "p. 10"
+    mask_section_refs: bool = True  # Section references like "Section 2.1", "Chapter III"
     
     # Placeholder style (backend-aware)
     placeholder_style: str = "angle"  # "angle" (<<TYPE_0001>>) or "alnum" (SCITRANS_TYPE_0001_SCITRANS)
@@ -260,7 +265,62 @@ class MaskingEngine:
                 ),
                 priority=35
             ))
-            
+        
+        # Enhanced masking patterns
+        if self.config.mask_toc_page_numbers:
+            # TOC page numbers: "... 5" or "...... 10"
+            patterns.append(MaskPattern(
+                name="toc_page_number",
+                pattern=re.compile(r'\.{2,}\s*\d+$', re.MULTILINE),
+                priority=45,
+                preserve_formatting=True
+            ))
+        
+        if self.config.mask_figure_table_refs:
+            # Figure/Table references: "Figure 1.1", "Fig. 2", "Table 3.2"
+            patterns.append(MaskPattern(
+                name="figure_table_ref",
+                pattern=re.compile(
+                    r'\b(?:figure|fig\.?|table|tab\.?|tableau|fig\.?)\s+[\d.]+(?:\s*[a-z])?',
+                    re.IGNORECASE
+                ),
+                priority=55,
+                preserve_formatting=True
+            ))
+        
+        if self.config.mask_page_refs:
+            # Page references: "see page 5", "p. 10", "pp. 10-12", "page 3"
+            patterns.append(MaskPattern(
+                name="page_reference",
+                pattern=re.compile(
+                    r'\b(?:page|p\.|pp\.)\s+\d+(?:[-\u2013\u2014]\d+)?',
+                    re.IGNORECASE
+                ),
+                priority=50,
+                preserve_formatting=True
+            ))
+            # "voir page suivante" type references
+            patterns.append(MaskPattern(
+                name="page_reference_text",
+                pattern=re.compile(
+                    r'(?:voir|see|see also|cf\.?)\s+(?:page|p\.)\s+\d+',
+                    re.IGNORECASE
+                ),
+                priority=50
+            ))
+        
+        if self.config.mask_section_refs:
+            # Section references: "Section 2.1", "Chapter III", "§ 3.2"
+            patterns.append(MaskPattern(
+                name="section_reference",
+                pattern=re.compile(
+                    r'\b(?:section|chapter|ch\.?|§|§§)\s+[IVX0-9.]+',
+                    re.IGNORECASE
+                ),
+                priority=50,
+                preserve_formatting=True
+            ))
+        
         # Sort by priority (highest first)
         return sorted(patterns, key=lambda p: p.priority, reverse=True)
     
@@ -434,8 +494,38 @@ class MaskingEngine:
                         logger.debug(f"Restored {mask.placeholder} using variant pattern: {pattern}")
                         break
                 
+                # If still not found, try partial matching (for LaTeX formulas that might have been modified)
+                if not found and mask.mask_type in ['latex', 'latex_inline', 'latex_display', 'latex_environment', 'latex_command']:
+                    # Look for partial matches - maybe LLM translated part of the placeholder
+                    # Try to find the mask ID in the text
+                    mask_id_match = re.search(r'(\d{4,})', mask.placeholder)  # Extract numeric ID
+                    if mask_id_match:
+                        mask_id = mask_id_match.group(1)
+                        # Look for any placeholder-like pattern with this ID
+                        partial_pattern = re.compile(
+                            r'<<[^>]*' + re.escape(mask_id) + r'[^>]*>>|SCITRANS[^_]*' + re.escape(mask_id) + r'[^_]*SCITRANS',
+                            re.IGNORECASE
+                        )
+                        partial_matches = list(re.finditer(partial_pattern, unmasked_text))
+                        if partial_matches:
+                            # Replace with original LaTeX
+                            for match in reversed(partial_matches):
+                                unmasked_text = unmasked_text[:match.start()] + mask.original + unmasked_text[match.end():]
+                            restored_count += 1
+                            found = True
+                            logger.debug(f"Restored {mask.placeholder} using partial ID match: {mask_id}")
+                
                 if not found:
-                    missing_masks.append(mask.placeholder)
+                    # Last resort: if this is a LaTeX mask and it's missing, restore from source
+                    # This ensures formulas are never lost
+                    if mask.mask_type.startswith('latex') and mask.original:
+                        logger.warning(f"LaTeX mask {mask.placeholder} not found in translation, restoring from source")
+                        # Try to find a reasonable place to insert it (end of block or near similar content)
+                        unmasked_text = unmasked_text + " " + mask.original
+                        restored_count += 1
+                        found = True
+                    else:
+                        missing_masks.append(mask.placeholder)
             else:
                 missing_masks.append(mask.placeholder)
                 
