@@ -516,12 +516,16 @@ class MaskingEngine:
                             logger.debug(f"Restored {mask.placeholder} using partial ID match: {mask_id}")
                 
                 if not found:
-                    # Last resort: if this is a LaTeX mask and it's missing, restore from source
-                    # This ensures formulas are never lost
-                    if mask.mask_type.startswith('latex') and mask.original:
-                        logger.warning(f"LaTeX mask {mask.placeholder} not found in translation, restoring from source")
-                        # Try to find a reasonable place to insert it (end of block or near similar content)
-                        unmasked_text = unmasked_text + " " + mask.original
+                    # CRITICAL FIX: Restore ALL missing masks from original content
+                    # Better to have the original content than a placeholder
+                    if mask.original:
+                        logger.warning(f"Mask {mask.placeholder} not found, restoring original content: {mask.original[:50]}...")
+                        # Try to replace generic <<PLACEHOLDER>> first
+                        if "<<PLACEHOLDER>>" in unmasked_text:
+                            unmasked_text = unmasked_text.replace("<<PLACEHOLDER>>", mask.original, 1)
+                        else:
+                            # Append at end if no generic placeholder
+                            unmasked_text = unmasked_text + " " + mask.original
                         restored_count += 1
                         found = True
                     else:

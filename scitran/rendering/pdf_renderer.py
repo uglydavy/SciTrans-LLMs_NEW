@@ -6,6 +6,7 @@ from typing import Optional, Dict, Tuple, List, Any
 import logging
 import tempfile
 import os
+import re
 
 try:
     import fitz  # PyMuPDF
@@ -570,7 +571,9 @@ class PDFRenderer:
                 self._redact_text_from_page(page, page_blocks)
                 
                 # Step 2: Insert translated text
-                for block in page_blocks:
+                # CRITICAL: Sort blocks by Y position to prevent overlapping
+                sorted_blocks = sorted(page_blocks, key=lambda b: (b.bbox.y0 if b.bbox else 0, b.bbox.x0 if b.bbox else 0))
+                for block in sorted_blocks:
                     self._insert_text_block(page, block)
                 pages_processed += 1
             else:
@@ -578,12 +581,39 @@ class PDFRenderer:
         
         logger.info(f"Processed {pages_processed} pages with translations out of {total_pages_in_doc} total pages")
         
-        # STEP 5: Create overflow pages if strategy is append_pages or smart (fallback)
-        if self.overflow_strategy in ["append_pages", "marker+append_pages", "smart"]:
-            overflow_blocks = [e for e in self.overflow_report if "full_text" in e]
-            if overflow_blocks:
-                logger.info(f"Creating overflow pages for {len(overflow_blocks)} blocks")
-                self._create_overflow_pages(doc, overflow_blocks)
+        # CRITICAL FIX: Don't create overflow pages - keep all blocks on original pages
+        # Overflow pages cause blocks to move and become unreadable
+        # Instead, use aggressive shrinking to fit text on original page
+        overflow_blocks = [e for e in self.overflow_report if "full_text" in e]
+        if overflow_blocks:
+            logger.warning(f"{len(overflow_blocks)} blocks had overflow - fitting on original pages with smaller font")
+            # Try to fit overflow blocks on their original pages
+            for event in overflow_blocks:
+                block_id = event.get("block_id")
+                page_num = event.get("page", 0)
+                if page_num < len(doc):
+                    page = doc[page_num]
+                    # Find the block
+                    for segment in document.segments:
+                        for block in segment.blocks:
+                            if block.block_id == block_id and block.bbox:
+                                text = event.get("full_text", block.translated_text or "")
+                                if text and block.bbox:
+                                    rect = fitz.Rect(block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1)
+                                    fontname, _, _ = self._get_font_name(block.font)
+                                    fontsize = event.get("fontsize", 10) * 0.7  # Much smaller
+                                    color = event.get("color", (0, 0, 0))
+                                    try:
+                                        rc = page.insert_textbox(
+                                            rect, text, fontsize=max(6.0, fontsize),
+                                            fontname=fontname, color=color, align=0,
+                                            lineheight=1.0
+                                        )
+                                        if rc >= 0:
+                                            logger.info(f"✓ Fitted overflow block {block_id} on original page {page_num + 1}")
+                                    except Exception as e:
+                                        logger.warning(f"Could not fit overflow block {block_id}: {e}")
+                                break
         
         # Save output (embed fonts if requested)
         save_opts = {"garbage": 4, "deflate": True}
@@ -648,12 +678,25 @@ class PDFRenderer:
                 fontname = unicode_font
                 logger.debug(f"Using Unicode font {fontname} for block {block.block_id} (Unicode chars detected)")
         
-        # Normalize apostrophes - ensure they're proper Unicode apostrophes
-        # Replace common problematic apostrophes with proper ones
-        text = text.replace("'", "'")  # Replace straight apostrophe with curly
-        text = text.replace("'", "'")  # Replace right single quote with apostrophe
+        # CRITICAL FIX: Clean up any "(? voir page suivante)" markers
+        import re as regex_module  # Use alias to avoid any variable shadowing
+        text = text.replace("(? voir page suivante)", "")
+        text = text.replace("(→ voir page suivante)", "")
+        text = text.replace("voir page suivante", "")
+        text = regex_module.sub(r'\(\?[^)]*\)', '', text)  # Remove any (? ...) patterns
         
-        # Detect alignment
+        # CRITICAL FIX: Ensure all placeholders are restored
+        if "<<PLACEHOLDER>>" in text or ("<<" in text and ">>" in text):
+            # Check if we have unrestored placeholders
+            if block.masks:
+                for mask in block.masks:
+                    if mask.placeholder in text:
+                        text = text.replace(mask.placeholder, mask.original)
+                # Clean up any remaining generic placeholders
+                text = regex_module.sub(r'<<PLACEHOLDER>>+', '', text)
+                text = regex_module.sub(r'<<[A-Z_0-9]+>>', '', text)
+        
+        # CRITICAL FIX: Preserve original alignment - don't auto-center
         alignment = 0  # Default: left align (0=left, 1=center, 2=right, 3=justify)
         if block.font and hasattr(block.font, 'alignment') and block.font.alignment:
             align_str = block.font.alignment.lower()
@@ -663,15 +706,9 @@ class PDFRenderer:
                 alignment = 2
             elif align_str == "justify":
                 alignment = 3
-        else:
-            # Infer alignment from block position
-            page_width = page.rect.width
-            block_center = (rect.x0 + rect.x1) / 2
-            page_center = page_width / 2
-            if abs(block_center - page_center) < page_width * 0.1:
-                alignment = 1  # Center
-            elif rect.x0 > page_width * 0.7:
-                alignment = 2  # Right
+            else:
+                alignment = 0  # Explicitly left
+        # DO NOT infer alignment from position - this causes wrong centering
         
         # Get font size - preserve original size for consistency
         if block.font and block.font.size and block.font.size > 0:
@@ -730,7 +767,7 @@ class PDFRenderer:
         
         # Normalize line breaks: replace multiple newlines with single space within paragraphs
         # But preserve intentional paragraph breaks (double newlines)
-        import re
+        # Note: re is imported at module level, no need to import here
         # Split by double newlines (paragraph breaks)
         paragraphs = text.split('\n\n')
         normalized_paragraphs = []
@@ -1009,15 +1046,8 @@ class PDFRenderer:
                 self.overflow_report[i] = overflow_event
                 break
         
-        # Insert marker in original location
-        marker = f"(→ voir page suivante)"
-        try:
-            page.insert_textbox(
-                rect, marker, fontsize=fontsize * 0.7,
-                fontname=fontname, color=(0.5, 0, 0), align=alignment
-            )
-        except:
-            pass
+        # CRITICAL FIX: Don't insert "(→ voir page suivante)" markers
+        # Instead, fit text on original page - no markers should appear
         
         return True  # Handled via append_pages
     

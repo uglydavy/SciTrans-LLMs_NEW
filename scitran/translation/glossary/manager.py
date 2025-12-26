@@ -327,6 +327,10 @@ class GlossaryManager:
         """Export all terms as simple dictionary."""
         return {term.source: term.target for term in self.terms.values()}
     
+    def get_glossary_dict(self) -> Dict[str, str]:
+        """Get glossary as dictionary (alias for to_dict for compatibility)."""
+        return self.to_dict()
+    
     def __len__(self) -> int:
         """Return number of terms."""
         return len(self.terms)

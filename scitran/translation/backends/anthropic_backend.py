@@ -51,17 +51,30 @@ class AnthropicBackend(TranslationBackend):
             # Initialize clients with optional custom base URL
             client_kwargs = {"api_key": self.api_key}
             if base_url:
-                # Fix: Remove trailing /v1 if present, Anthropic SDK adds it automatically
-                # Also handle cases where base_url already includes /v1
+                # CRITICAL FIX: Handle API console format properly
+                base_url = base_url.rstrip('/')
+                # Remove /v1 if present (SDK adds it)
                 if base_url.endswith("/v1"):
-                    base_url = base_url[:-3]  # Remove /v1
+                    base_url = base_url[:-3]
                 elif base_url.endswith("/v1/"):
-                    base_url = base_url[:-4]  # Remove /v1/
+                    base_url = base_url[:-4]
+                # Ensure URL has protocol
+                if not base_url.startswith("http"):
+                    base_url = f"https://{base_url}"
                 client_kwargs["base_url"] = base_url
                 logger.info(f"Using custom Anthropic API endpoint: {base_url}")
+                logger.info(f"API Key (first 10 chars): {self.api_key[:10]}...")
             
-            self.client = Anthropic(**client_kwargs)
-            self.async_client = AsyncAnthropic(**client_kwargs)
+            try:
+                self.client = Anthropic(**client_kwargs)
+                self.async_client = AsyncAnthropic(**client_kwargs)
+                logger.info("✓ Anthropic client initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize Anthropic client: {e}")
+                logger.info("For API console (api.qidianai.xyz), ensure:")
+                logger.info("  export ANTHROPIC_API_BASE_URL='https://api.qidianai.xyz'")
+                logger.info("  export ANTHROPIC_API_KEY='your-key-here'")
+                raise
         else:
             self.client = None
             self.async_client = None
