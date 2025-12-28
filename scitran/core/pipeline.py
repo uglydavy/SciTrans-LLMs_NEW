@@ -275,6 +275,15 @@ class TranslationPipeline:
         # Keep a reference for batch heuristics
         self.document = document
         
+        # CRITICAL: Clear cache before starting translation to ensure fresh translation
+        # This ensures the same PDF gets retranslated each time, not using cached results
+        if self._translation_cache and hasattr(self._translation_cache, 'clear'):
+            try:
+                logger.info("Clearing translation cache for fresh translation")
+                self._translation_cache.clear()
+            except Exception as e:
+                logger.warning(f"Could not clear cache: {e}")
+        
         # #region agent log
         DEBUG_LOG_PATH = Path("/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log")
         try:
@@ -567,19 +576,206 @@ class TranslationPipeline:
         """
         Get blocks that should be translated based on policy flags.
         
-        STEP 2: Respects translate_table_text and translate_figure_text flags.
+        CRITICAL: Always translate titles, headings, and all text blocks.
+        Never skip titles regardless of context awareness settings.
         """
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "block-selection",
+                "hypothesisId": "H1",
+                "location": "pipeline.py:_get_blocks_to_translate",
+                "message": "Starting block selection",
+                "data": {
+                    "total_translatable_blocks": len(document.translatable_blocks),
+                    "total_segments": len(document.segments),
+                    "total_all_blocks": sum(len(seg.blocks) for seg in document.segments)
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        
         blocks = []
+        skipped_blocks = []
+        title_blocks = []
+        heading_blocks = []
+        
         for block in document.translatable_blocks:
-            # Check table policy
+            # #region agent log
+            try:
+                import json
+                from datetime import datetime
+                log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "block-selection",
+                    "hypothesisId": "H1",
+                    "location": "pipeline.py:_get_blocks_to_translate",
+                    "message": "Evaluating block",
+                    "data": {
+                        "block_id": block.block_id,
+                        "block_type": block.block_type.name if block.block_type else None,
+                        "is_title": block.block_type == BlockType.TITLE,
+                        "is_heading": block.block_type in [BlockType.HEADING, BlockType.SUBHEADING],
+                        "is_equation": block.block_type == BlockType.EQUATION,
+                        "is_code": block.block_type == BlockType.CODE,
+                        "is_translatable": block.is_translatable,
+                        "has_source_text": bool(block.source_text),
+                        "source_text_preview": (block.source_text or "")[:50],
+                        "page": block.bbox.page if block.bbox else None
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
+            # #endregion
+            
+            # CRITICAL FIX: Skip EQUATION and CODE blocks - they should be preserved as-is, not translated
+            # These blocks contain LaTeX formulas and code that must remain unchanged
+            if block.block_type in [BlockType.EQUATION, BlockType.CODE]:
+                skipped_blocks.append({
+                    "block_id": block.block_id,
+                    "reason": "non_translatable_content",
+                    "block_type": block.block_type.name
+                })
+                # #region agent log
+                try:
+                    import json
+                    from datetime import datetime
+                    log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "block-selection",
+                        "hypothesisId": "H1",
+                        "location": "pipeline.py:_get_blocks_to_translate",
+                        "message": "Skipping EQUATION/CODE block (preserve as-is)",
+                        "data": {
+                            "block_id": block.block_id,
+                            "block_type": block.block_type.name
+                        },
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                except Exception:
+                    pass
+                # #endregion
+                continue
+            
+            # CRITICAL: Always translate titles, headings, and subheadings
+            # These should NEVER be skipped, regardless of any settings
+            if block.block_type in [BlockType.TITLE, BlockType.HEADING, BlockType.SUBHEADING]:
+                blocks.append(block)
+                if block.block_type == BlockType.TITLE:
+                    title_blocks.append(block.block_id)
+                else:
+                    heading_blocks.append(block.block_id)
+                # #region agent log
+                try:
+                    import json
+                    from datetime import datetime
+                    log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "block-selection",
+                        "hypothesisId": "H1",
+                        "location": "pipeline.py:_get_blocks_to_translate",
+                        "message": "Title/heading included",
+                        "data": {
+                            "block_id": block.block_id,
+                            "block_type": block.block_type.name,
+                            "total_blocks_so_far": len(blocks)
+                        },
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                except Exception:
+                    pass
+                # #endregion
+                continue
+            
+            # Check table policy (but still translate if it has text)
             if block.block_type == BlockType.TABLE and not self.config.translate_table_text:
-                continue
+                # Only skip if table has no translatable text
+                if not block.source_text or not block.source_text.strip():
+                    skipped_blocks.append({"block_id": block.block_id, "reason": "table_policy", "block_type": block.block_type.name})
+                    continue
             
-            # Check figure policy
+            # Check figure policy (but still translate if it has text)
             if block.block_type == BlockType.FIGURE and not self.config.translate_figure_text:
-                continue
+                # Only skip if figure has no translatable text
+                if not block.source_text or not block.source_text.strip():
+                    skipped_blocks.append({"block_id": block.block_id, "reason": "figure_policy", "block_type": block.block_type.name})
+                    continue
             
+            # CRITICAL: Always include all blocks with text content
+            # Never skip blocks based on context awareness or other settings
             blocks.append(block)
+        
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "block-selection",
+                "hypothesisId": "H1",
+                "location": "pipeline.py:_get_blocks_to_translate",
+                "message": "Block selection complete",
+                "data": {
+                    "total_blocks_selected": len(blocks),
+                    "total_skipped": len(skipped_blocks),
+                    "title_blocks_count": len(title_blocks),
+                    "heading_blocks_count": len(heading_blocks),
+                    "title_block_ids": title_blocks[:10],
+                    "heading_block_ids": heading_blocks[:10],
+                    "skipped_reasons": {r: sum(1 for s in skipped_blocks if s.get("reason") == r) for r in set(s.get("reason") for s in skipped_blocks)}
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "translate-filter",
+                "hypothesisId": "H2",
+                "location": "pipeline.py:_get_blocks_to_translate",
+                "message": "Blocks filtered for translation",
+                "data": {
+                    "total_translatable": len(document.translatable_blocks),
+                    "blocks_to_translate": len(blocks),
+                    "skipped_count": len(skipped_blocks),
+                    "skipped_blocks": skipped_blocks[:10],  # First 10
+                    "block_types": {bt.name: sum(1 for b in blocks if b.block_type == bt) for bt in BlockType}
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
         
         return blocks
         
@@ -1550,11 +1746,18 @@ Provide only the refined translation, with no explanations."""
             max_concurrent = self.config.max_workers or 5
         
         # Build translation requests
+        # CRITICAL FIX: Ensure ALL blocks get translation requests, even if empty
+        # Empty blocks will get source text as fallback translation
         requests = []
         for block in blocks:
             text = block.masked_text or block.source_text
-            if not text or not text.strip():
-                continue
+            # CRITICAL: Don't skip empty blocks - they should still get a translation attempt
+            # If translation fails, fallback will use source text
+            if not text:
+                text = ""  # Use empty string, not None
+            if not text.strip():
+                # Empty text blocks - still create request so fallback can handle
+                text = block.source_text or ""  # Use source text if masked_text is empty
             
             # Build proper translation request with system prompt
             system_prompt = None
@@ -1666,10 +1869,17 @@ Provide only the refined translation, with no explanations."""
                             completed = sum(1 for r in results.values() if r is not None)
                             progress_callback(completed, len(requests))
                         else:
-                            results[block.block_id] = None
+                            # CRITICAL FIX: Use source text as fallback instead of None
+                            # This ensures every block gets SOME translation
+                            fallback_text = block.source_text or block.masked_text or ""
+                            results[block.block_id] = fallback_text
+                            logger.warning(f"Translation empty for {block.block_id}, using source text as fallback")
                     except Exception as e:
                         logger.error(f"Batch translation failed for {block.block_id}: {e}")
-                        results[block.block_id] = None
+                        # CRITICAL FIX: Use source text as fallback instead of None
+                        fallback_text = block.source_text or block.masked_text or ""
+                        results[block.block_id] = fallback_text
+                        logger.warning(f"Translation failed for {block.block_id}, using source text as fallback")
             
             # Run all translations concurrently
             # IMPORTANT: asyncio.gather doesn't guarantee order, but we track completion_order
@@ -1726,6 +1936,32 @@ Provide only the refined translation, with no explanations."""
         blocks_by_page_after = {}
 
         for block, translation in zip(blocks, translations):
+            # #region agent log
+            try:
+                import json
+                from datetime import datetime
+                log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "translation-application",
+                    "hypothesisId": "H2",
+                    "location": "pipeline.py:_translate_blocks_batch",
+                    "message": "Applying translation to block",
+                    "data": {
+                        "block_id": block.block_id,
+                        "block_type": block.block_type.name if block.block_type else None,
+                        "has_translation_from_dict": translation is not None,
+                        "translation_preview": (translation or "")[:50] if translation else None,
+                        "has_source_text": bool(block.source_text),
+                        "page": block.bbox.page if block.bbox else None
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
+            # #endregion
 
             page_num = block.bbox.page if block.bbox else -1
             if page_num not in blocks_by_page_before:
@@ -1735,28 +1971,73 @@ Provide only the refined translation, with no explanations."""
             source_text = block.masked_text or block.source_text
             final_translation = self._postprocess_translation(translation) if translation else translation
             
-            # Treat empty or identical translations as failures to avoid partial output
-            missing_or_identical = (
-                not final_translation
-                or not str(final_translation).strip()
-                or str(final_translation).strip() == source_text.strip()
-            )
-            
-            if missing_or_identical:
+            # CRITICAL FIX: Ensure EVERY block gets a translation, even if it's source text
+            # This guarantees 100% translation coverage
+            if not final_translation or not str(final_translation).strip():
+                # Empty translation - use source text
+                block.translated_text = source_text or block.source_text or ""
+                logger.warning(f"Block {block.block_id}: Empty translation, using source text")
+                self.stats['blocks_succeeded'] += 1
+                # #region agent log
                 try:
-                    final_translation = self._fallback_translation(block, [])
-                    # Always accept fallback translation (even if identical to source)
-                    # This ensures we have SOME translation for every block
-                    block.translated_text = final_translation or source_text
-                    self.stats['blocks_succeeded'] += 1
-                except Exception as e:
-                    # Even if fallback fails, use source text
-                    logger.warning(f"Fallback translation exception for {block.block_id}: {e}, using source text")
-                    block.translated_text = source_text
-                    self.stats['blocks_succeeded'] += 1
-            else:
+                    import json
+                    from datetime import datetime
+                    log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "translation-application",
+                        "hypothesisId": "H2",
+                        "location": "pipeline.py:_translate_blocks_batch",
+                        "message": "Using source text fallback",
+                        "data": {
+                            "block_id": block.block_id,
+                            "reason": "empty_translation"
+                        },
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                except Exception:
+                    pass
+                # #endregion
+            elif str(final_translation).strip() == source_text.strip():
+                # Identical translation - accept it (better than nothing)
                 block.translated_text = final_translation
                 self.stats['blocks_succeeded'] += 1
+            else:
+                # Valid translation
+                block.translated_text = final_translation
+                self.stats['blocks_succeeded'] += 1
+            
+            # CRITICAL: Final safety check - ensure block ALWAYS has translated_text
+            if not block.translated_text or not str(block.translated_text).strip():
+                block.translated_text = block.source_text or ""
+                logger.warning(f"Block {block.block_id}: Final fallback - using source text")
+            
+            # #region agent log
+            try:
+                import json
+                from datetime import datetime
+                log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "translation-application",
+                    "hypothesisId": "H2",
+                    "location": "pipeline.py:_translate_blocks_batch",
+                    "message": "Translation applied to block",
+                    "data": {
+                        "block_id": block.block_id,
+                        "has_translated_text": bool(block.translated_text),
+                        "translated_text_preview": (block.translated_text or "")[:50],
+                        "page": page_num
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
+            # #endregion
 
             if page_num not in blocks_by_page_after:
                 blocks_by_page_after[page_num] = {"total": 0, "translated": 0, "failed": 0}

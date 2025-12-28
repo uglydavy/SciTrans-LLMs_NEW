@@ -25,28 +25,32 @@ class TranslationCache:
         self, 
         cache_dir: str = ".cache/translations", 
         use_disk: bool = True,
-        fallback_to_memory: bool = True
+        fallback_to_memory: bool = True,
+        ttl: int = 604800  # Default: 7 days (in seconds)
     ):
         """
-        Initialize cache with graceful fallback.
+        Initialize cache with graceful fallback and expiration.
         
         Args:
             cache_dir: Directory for disk cache
             use_disk: Use disk cache (requires diskcache)
             fallback_to_memory: Fallback to memory cache if disk cache fails
+            ttl: Time-to-live in seconds (default: 7 days). Set to None for no expiration.
         """
         self.cache_dir = Path(cache_dir)
         self.use_disk = False
         self.fallback_to_memory = fallback_to_memory
         self.memory_cache: Dict[str, str] = {}
         self._cache_errors: List[str] = []
+        self.ttl = ttl  # Cache expiration time
         
         if use_disk and HAS_DISKCACHE:
             try:
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
+                # Initialize with eviction policy if diskcache supports it
                 self.disk_cache = diskcache.Cache(str(self.cache_dir))
                 self.use_disk = True
-                logger.debug(f"Using disk cache at {self.cache_dir}")
+                logger.debug(f"Using disk cache at {self.cache_dir} (TTL: {ttl}s)")
             except Exception as e:
                 error_msg = f"Failed to initialize disk cache: {e}"
                 self._cache_errors.append(error_msg)
@@ -76,7 +80,7 @@ class TranslationCache:
         backend: str
     ) -> Optional[str]:
         """
-        Get cached translation with graceful error handling.
+        Get cached translation with graceful error handling and expiration check.
         
         Args:
             text: Source text
@@ -86,14 +90,31 @@ class TranslationCache:
             
         Returns:
             Cached translation or None (never raises)
+            Returns None if cache entry has expired
         """
         key = self._make_key(text, source_lang, target_lang, backend)
         
         try:
             if self.use_disk:
-                return self.disk_cache.get(key)
+                # diskcache handles expiration automatically
+                result = self.disk_cache.get(key)
+                return result
             else:
-                return self.memory_cache.get(key)
+                # Manual expiration check for memory cache
+                entry = self.memory_cache.get(key)
+                if entry:
+                    if isinstance(entry, dict):
+                        # New format with timestamp
+                        import time
+                        if self.ttl and time.time() - entry['timestamp'] > self.ttl:
+                            # Expired - remove it
+                            del self.memory_cache[key]
+                            return None
+                        return entry['value']
+                    else:
+                        # Old format (backward compatibility)
+                        return entry
+                return None
         except Exception as e:
             error_msg = f"Cache get failed: {e}"
             self._cache_errors.append(error_msg)
@@ -110,7 +131,7 @@ class TranslationCache:
         translation: str
     ) -> None:
         """
-        Cache translation with graceful error handling.
+        Cache translation with graceful error handling and expiration.
         
         Args:
             text: Source text
@@ -121,14 +142,24 @@ class TranslationCache:
             
         Note:
             Never raises - cache errors are logged but non-fatal
+            Entries expire after self.ttl seconds (default: 7 days)
         """
         key = self._make_key(text, source_lang, target_lang, backend)
         
         try:
             if self.use_disk:
-                self.disk_cache.set(key, translation)
+                # Set with expiration if ttl is specified
+                if self.ttl:
+                    self.disk_cache.set(key, translation, expire=self.ttl)
+                else:
+                    self.disk_cache.set(key, translation)
             else:
-                self.memory_cache[key] = translation
+                # Memory cache with timestamp for manual expiration
+                import time
+                self.memory_cache[key] = {
+                    'value': translation,
+                    'timestamp': time.time()
+                }
         except Exception as e:
             error_msg = f"Cache set failed: {e}"
             self._cache_errors.append(error_msg)
@@ -137,7 +168,11 @@ class TranslationCache:
             # If disk cache fails and we have fallback, try memory
             if self.use_disk and self.fallback_to_memory:
                 try:
-                    self.memory_cache[key] = translation
+                    import time
+                    self.memory_cache[key] = {
+                        'value': translation,
+                        'timestamp': time.time()
+                    }
                     logger.debug("Fell back to memory cache")
                 except Exception:
                     pass  # Even memory cache failed, but that's OK

@@ -50,17 +50,20 @@ class TranslationJob:
 
 
 class PersistentCache:
-    """Persistent disk cache for translations."""
+    """Persistent disk cache for translations with automatic expiration."""
     
-    def __init__(self, cache_dir: str = ".cache/translations"):
+    def __init__(self, cache_dir: str = ".cache/translations", ttl_days: int = 7):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.ttl_seconds = ttl_days * 86400  # Convert days to seconds
         
         if HAS_DISKCACHE:
             self.cache = diskcache.Cache(str(self.cache_dir), size_limit=500 * 1024 * 1024)  # 500MB
+            logger.info(f"Initialized disk cache with {ttl_days}-day expiration")
         else:
             self.cache = {}
             self._load_json_cache()
+            logger.info(f"Using JSON cache with {ttl_days}-day expiration")
     
     def _make_key(self, text: str, source: str, target: str) -> str:
         content = f"{source}|{target}|{text}"
@@ -69,15 +72,36 @@ class PersistentCache:
     def get(self, text: str, source: str, target: str) -> Optional[str]:
         key = self._make_key(text, source, target)
         if HAS_DISKCACHE:
+            # diskcache handles expiration automatically
             return self.cache.get(key)
-        return self.cache.get(key)
+        else:
+            # Check expiration for JSON cache
+            entry = self.cache.get(key)
+            if entry and isinstance(entry, dict) and 'timestamp' in entry:
+                import time
+                if time.time() - entry['timestamp'] > self.ttl_seconds:
+                    # Expired - remove it
+                    del self.cache[key]
+                    self._save_json_cache()
+                    return None
+                return entry.get('value')
+            elif isinstance(entry, str):
+                # Old format - return as-is (will expire when cache is cleared)
+                return entry
+            return None
     
     def set(self, text: str, source: str, target: str, translation: str):
         key = self._make_key(text, source, target)
         if HAS_DISKCACHE:
-            self.cache.set(key, translation, expire=86400 * 30)  # 30 days
+            # Set with expiration
+            self.cache.set(key, translation, expire=self.ttl_seconds)
         else:
-            self.cache[key] = translation
+            # Store with timestamp for expiration check
+            import time
+            self.cache[key] = {
+                'value': translation,
+                'timestamp': time.time()
+            }
             self._save_json_cache()
     
     def _load_json_cache(self):
@@ -94,6 +118,15 @@ class PersistentCache:
             cache_file.write_text(json.dumps(self.cache))
         except Exception:
             pass
+    
+    def clear(self):
+        """Clear all cached translations."""
+        if HAS_DISKCACHE:
+            self.cache.clear()
+        else:
+            self.cache = {}
+            self._save_json_cache()
+        logger.info("Cache cleared")
     
     def stats(self) -> Dict:
         if HAS_DISKCACHE:

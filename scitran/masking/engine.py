@@ -46,6 +46,10 @@ class MaskingConfig:
     mask_page_refs: bool = True  # Page references like "see page 5", "p. 10"
     mask_section_refs: bool = True  # Section references like "Section 2.1", "Chapter III"
     
+    # Non-translatable options (skip masking entirely - leave unchanged)
+    treat_toc_page_numbers_as_non_translatable: bool = False  # If True, don't mask TOC page numbers (leave as-is)
+    treat_page_refs_as_non_translatable: bool = False  # If True, don't mask page refs including "voir page suivante" (leave as-is)
+    
     # Placeholder style (backend-aware)
     placeholder_style: str = "angle"  # "angle" (<<TYPE_0001>>) or "alnum" (SCITRANS_TYPE_0001_SCITRANS)
     placeholder_prefix: str = "SCITRANS"  # Prefix for alnum style
@@ -267,7 +271,8 @@ class MaskingEngine:
             ))
         
         # Enhanced masking patterns
-        if self.config.mask_toc_page_numbers:
+        # CRITICAL: Only mask TOC page numbers if not treating as non-translatable
+        if self.config.mask_toc_page_numbers and not self.config.treat_toc_page_numbers_as_non_translatable:
             # TOC page numbers: "... 5" or "...... 10"
             patterns.append(MaskPattern(
                 name="toc_page_number",
@@ -288,7 +293,8 @@ class MaskingEngine:
                 preserve_formatting=True
             ))
         
-        if self.config.mask_page_refs:
+        # CRITICAL: Only mask page refs if not treating as non-translatable
+        if self.config.mask_page_refs and not self.config.treat_page_refs_as_non_translatable:
             # Page references: "see page 5", "p. 10", "pp. 10-12", "page 3"
             patterns.append(MaskPattern(
                 name="page_reference",
@@ -299,11 +305,14 @@ class MaskingEngine:
                 priority=50,
                 preserve_formatting=True
             ))
-            # "voir page suivante" type references
+            # "voir page suivante" type references - CRITICAL: Don't mask if non-translatable
             patterns.append(MaskPattern(
                 name="page_reference_text",
                 pattern=re.compile(
-                    r'(?:voir|see|see also|cf\.?)\s+(?:page|p\.)\s+\d+',
+                    r'(?:voir|see|see also|cf\.?)\s+(?:page|p\.)\s+\d+|'
+                    r'(?:voir|see)\s+page\s+suivante|'
+                    r'\(\?\s*voir\s+page\s+suivante\)|'
+                    r'\(→\s*voir\s+page\s+suivante\)',
                     re.IGNORECASE
                 ),
                 priority=50
@@ -516,20 +525,41 @@ class MaskingEngine:
                             logger.debug(f"Restored {mask.placeholder} using partial ID match: {mask_id}")
                 
                 if not found:
-                    # CRITICAL FIX: Restore ALL missing masks from original content
-                    # Better to have the original content than a placeholder
+                    # CRITICAL FIX: Try to reinsert original content directly
+                    # Better to have original content than a placeholder or missing text
                     if mask.original:
-                        logger.warning(f"Mask {mask.placeholder} not found, restoring original content: {mask.original[:50]}...")
                         # Try to replace generic <<PLACEHOLDER>> first
                         if "<<PLACEHOLDER>>" in unmasked_text:
                             unmasked_text = unmasked_text.replace("<<PLACEHOLDER>>", mask.original, 1)
+                            restored_count += 1
+                            found = True
+                            logger.info(f"Restored {mask.placeholder} by replacing generic placeholder")
+                        elif mask.mask_type in ['latex', 'latex_inline', 'latex_display', 'latex_environment', 'equation']:
+                            # For LaTeX/formulas, try to insert at a reasonable position
+                            # Look for sentence boundaries or insert at end of first sentence
+                            sentences = unmasked_text.split('. ')
+                            if len(sentences) > 0:
+                                # Insert after first sentence for LaTeX
+                                sentences[0] = sentences[0] + " " + mask.original
+                                unmasked_text = '. '.join(sentences)
+                                restored_count += 1
+                                found = True
+                                logger.info(f"Restored LaTeX {mask.placeholder} by inserting after first sentence")
                         else:
-                            # Append at end if no generic placeholder
+                            # For other types, append at end as fallback
+                            # This is better than leaving placeholder
                             unmasked_text = unmasked_text + " " + mask.original
-                        restored_count += 1
-                        found = True
-                    else:
+                            restored_count += 1
+                            found = True
+                            logger.warning(f"Restored {mask.placeholder} by appending original content (preferred position not found)")
+                    
+                    if not found:
+                        # Last resort: mark as missing and report error
                         missing_masks.append(mask.placeholder)
+                        logger.error(
+                            f"Mask {mask.placeholder} (type: {mask.mask_type}) not found in translation "
+                            f"and could not be restored. Original content: {mask.original[:50] if mask.original else 'N/A'}..."
+                        )
             else:
                 missing_masks.append(mask.placeholder)
                 

@@ -227,6 +227,37 @@ class PDFParser:
                     elif style_features.is_equation:
                         block_type = BlockType.EQUATION
                     
+                    # #region agent log
+                    try:
+                        import json
+                        from datetime import datetime
+                        log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                        log_entry = {
+                            "sessionId": "debug-session",
+                            "runId": "parse-pdf",
+                            "hypothesisId": "H1",
+                            "location": "pdf_parser.py:block_classification",
+                            "message": "Block extracted and classified",
+                            "data": {
+                                "block_id": f"block_{block_counter}",
+                                "block_type": block_type.name,
+                                "is_heading": style_features.is_heading,
+                                "is_list_item": style_features.is_list_item,
+                                "heading_level": style_features.heading_level,
+                                "list_style": style_features.list_style,
+                                "text_preview": block_text[:100],
+                                "text_length": len(block_text),
+                                "page": page_num,
+                                "bbox": [bbox[0], bbox[1], bbox[2], bbox[3]]
+                            },
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        with open(log_path, 'a', encoding='utf-8') as f:
+                            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                    except Exception:
+                        pass
+                    # #endregion
+                    
                     # Create enhanced FontInfo
                     font_info = FontInfo(
                         family=dominant_font_dict.get("family", "helv"),

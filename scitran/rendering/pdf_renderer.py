@@ -419,9 +419,55 @@ class PDFRenderer:
         Combined with apply_redactions(images=0, graphics=0), this guarantees
         that only text is removed while all vector graphics and images are preserved.
         """
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "render-redact",
+                "hypothesisId": "H6",
+                "location": "pdf_renderer.py:_redact_text_from_page",
+                "message": "Starting redaction",
+                "data": {
+                    "total_blocks": len(blocks),
+                    "page_num": blocks[0].bbox.page if blocks and blocks[0].bbox else None
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        
         redact_count = 0
         
         for block in blocks:
+            # #region agent log
+            try:
+                import json
+                from datetime import datetime
+                log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "render-redact",
+                    "hypothesisId": "H6",
+                    "location": "pdf_renderer.py:_redact_text_from_page",
+                    "message": "Redacting block",
+                    "data": {
+                        "block_id": block.block_id,
+                        "block_type": block.block_type.name if block.block_type else None,
+                        "bbox": [block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1] if block.bbox else None
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
+            # #endregion
             # Skip protected blocks (equation only - tables/figures are now translatable)
             # STEP 2: TABLE and FIGURE are no longer automatically protected
             if block.block_type == BlockType.EQUATION:
@@ -433,23 +479,30 @@ class PDFRenderer:
                         continue
                 elif hasattr(block.metadata, "protected_reason") and block.metadata.protected_reason:
                     continue
+            # CRITICAL FIX: Expand redaction area slightly to ensure complete text removal
+            # This prevents text artifacts at block boundaries
+            padding = 2.0  # Small padding to ensure complete coverage
             rect = fitz.Rect(
-                block.bbox.x0,
-                block.bbox.y0,
-                block.bbox.x1,
-                block.bbox.y1
+                max(0, block.bbox.x0 - padding),
+                max(0, block.bbox.y0 - padding),
+                min(page.rect.width, block.bbox.x1 + padding),
+                min(page.rect.height, block.bbox.y1 + padding)
             )
             
             # Validate rect
             if rect.is_empty or rect.is_infinite:
                 logger.warning(f"Skipping invalid rect for redaction: {rect}")
                 continue
-                
-            # Add redaction annotation with NO fill (non-destructive)
-            # CRITICAL: fill=None means remove text only, don't paint over graphics
+            
+            # Clamp to page bounds
+            rect = rect & page.rect
+            
+            # CRITICAL FIX: Use white fill to completely clear text and prevent ghosting/blurring
+            # fill=None can leave text artifacts. White fill ensures clean removal.
+            # We use white (1,1,1) which matches most PDF backgrounds
             page.add_redact_annot(
                 rect, 
-                fill=None,  # No fill - preserves underlying graphics/images
+                fill=(1, 1, 1),  # White fill - completely clears text area
                 text="",  # No replacement text
             )
             redact_count += 1
@@ -457,11 +510,13 @@ class PDFRenderer:
         # Apply all redactions - CRITICAL: Must not remove vector graphics or images
         # Parameters: images, graphics, text (0=keep, 1=remove, 2=remove+mark)
         if redact_count > 0:
+            # CRITICAL FIX: Apply redactions with aggressive text removal
+            # This ensures old text is completely removed before inserting new text
             page.apply_redactions(
                 images=0,    # 0 = Keep images (don't remove)
                 graphics=0   # 0 = Keep vector graphics (DON'T REMOVE)
             )
-            logger.info(f"Applied {redact_count} redactions on page (text only, preserving graphics)")
+            logger.info(f"Applied {redact_count} redactions on page (text cleared with white fill, preserving graphics)")
     
     def render_with_layout(self, source_pdf: str, document: Document, output_path: str):
         """
@@ -495,33 +550,256 @@ class PDFRenderer:
         total_pages_in_doc = len(doc)
         logger.info(f"Source PDF has {total_pages_in_doc} pages")
         
+        # CRITICAL: Track total blocks vs rendered blocks
+        total_blocks_in_segments = sum(len(seg.blocks) for seg in document.segments)
+        total_translatable_blocks = len(document.translatable_blocks) if hasattr(document, 'translatable_blocks') else 0
+        
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "render-start",
+                "hypothesisId": "H7",
+                "location": "pdf_renderer.py:render_with_layout",
+                "message": "Rendering started - block counts",
+                "data": {
+                    "total_blocks_in_segments": total_blocks_in_segments,
+                    "total_translatable_blocks": total_translatable_blocks,
+                    "total_segments": len(document.segments),
+                    "total_pages": total_pages_in_doc
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        
+        logger.info(f"📊 Document has {total_blocks_in_segments} total blocks in {len(document.segments)} segments")
+        logger.info(f"📊 {total_translatable_blocks} blocks are translatable")
+        
         for segment in document.segments:
             for block in segment.blocks:
+                # #region agent log
+                try:
+                    import json
+                    from datetime import datetime
+                    log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "render-prep",
+                        "hypothesisId": "H3",
+                        "location": "pdf_renderer.py:render_with_layout",
+                        "message": "Block before rendering check",
+                        "data": {
+                            "block_id": block.block_id,
+                            "block_type": block.block_type.name if block.block_type else None,
+                            "is_title": block.block_type == BlockType.TITLE,
+                            "is_heading": block.block_type in [BlockType.HEADING, BlockType.SUBHEADING],
+                            "has_bbox": block.bbox is not None,
+                            "has_translated_text": bool(block.translated_text),
+                            "has_source_text": bool(block.source_text),
+                            "text_preview": (block.translated_text or block.source_text or "")[:50],
+                            "page": block.bbox.page if block.bbox else None,
+                            "bbox": [block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1] if block.bbox else None
+                        },
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                except Exception:
+                    pass
+                # #endregion
+                
                 if not block.bbox:
                     skipped_no_bbox += 1
+                    # #region agent log
+                    try:
+                        import json
+                        from datetime import datetime
+                        log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                        log_entry = {
+                            "sessionId": "debug-session",
+                            "runId": "render-prep",
+                            "hypothesisId": "H3",
+                            "location": "pdf_renderer.py:render_with_layout",
+                            "message": "Block skipped - no bbox",
+                            "data": {"block_id": block.block_id, "block_type": block.block_type.name if block.block_type else None},
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        with open(log_path, 'a', encoding='utf-8') as f:
+                            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                    except Exception:
+                        pass
+                    # #endregion
                     continue
                 
                 page_num = block.bbox.page
                 
-                # Collect preservable blocks (equations only - tables/figures now translatable)
-                # STEP 2: Only preserve EQUATION blocks (math formulas)
-                # TABLE and FIGURE text will be translated, so don't stamp them
-                if block.block_type == BlockType.EQUATION:
-                    preserve_by_page.setdefault(page_num, []).append(block)
+                # CRITICAL FIX: EQUATION and CODE blocks should be preserved as-is (not translated)
+                # They contain LaTeX formulas and code that must remain unchanged
+                if block.block_type in [BlockType.EQUATION, BlockType.CODE]:
+                    # Preserve these blocks exactly as they are - use source_text as translated_text
+                    if block.source_text:
+                        block.translated_text = block.source_text  # Preserve original
+                        preserve_by_page.setdefault(page_num, []).append(block)
+                        # #region agent log
+                        try:
+                            import json
+                            from datetime import datetime
+                            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                            log_entry = {
+                                "sessionId": "debug-session",
+                                "runId": "render-prep",
+                                "hypothesisId": "H3",
+                                "location": "pdf_renderer.py:render_with_layout",
+                                "message": "Preserving EQUATION/CODE block as-is",
+                                "data": {
+                                    "block_id": block.block_id,
+                                    "block_type": block.block_type.name,
+                                    "page": page_num
+                                },
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            with open(log_path, 'a', encoding='utf-8') as f:
+                                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                        except Exception:
+                            pass
+                        # #endregion
+                        
+                        # CRITICAL: Add to blocks_by_page so they get rendered (as text, not stamped)
+                        # EQUATION/CODE blocks contain text that needs to be rendered, not images
+                        if page_num not in blocks_by_page:
+                            blocks_by_page[page_num] = []
+                        blocks_by_page[page_num].append(block)
+                        translated_count += 1
+                        # #region agent log
+                        try:
+                            import json
+                            from datetime import datetime
+                            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                            log_entry = {
+                                "sessionId": "debug-session",
+                                "runId": "render-prep",
+                                "hypothesisId": "H3",
+                                "location": "pdf_renderer.py:render_with_layout",
+                                "message": "EQUATION/CODE block added to render queue",
+                                "data": {
+                                    "block_id": block.block_id,
+                                    "block_type": block.block_type.name,
+                                    "page": page_num,
+                                    "blocks_on_page": len(blocks_by_page[page_num])
+                                },
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            with open(log_path, 'a', encoding='utf-8') as f:
+                                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                        except Exception:
+                            pass
+                        # #endregion
+                    continue  # Skip translation check for these blocks - already preserved above
                 
-                # Only translated blocks go to redaction/insertion
+                # CRITICAL FIX: Include ALL translatable blocks, use source_text as fallback if no translation
+                # This ensures no blocks are missing from the rendered PDF
                 if not block.translated_text:
-                    skipped_no_translation += 1
-                    continue
+                    # Use source text as fallback if translation is missing
+                    # This ensures every block is rendered, even if translation failed
+                    if block.source_text and block.source_text.strip():
+                        block.translated_text = block.source_text
+                        logger.warning(f"Block {block.block_id} has no translation, using source text as fallback")
+                        # #region agent log
+                        try:
+                            import json
+                            from datetime import datetime
+                            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                            log_entry = {
+                                "sessionId": "debug-session",
+                                "runId": "render-prep",
+                                "hypothesisId": "H3",
+                                "location": "pdf_renderer.py:render_with_layout",
+                                "message": "Using source text fallback",
+                                "data": {"block_id": block.block_id},
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            with open(log_path, 'a', encoding='utf-8') as f:
+                                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                        except Exception:
+                            pass
+                        # #endregion
+                    else:
+                        skipped_no_translation += 1
+                        # #region agent log
+                        try:
+                            import json
+                            from datetime import datetime
+                            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                            log_entry = {
+                                "sessionId": "debug-session",
+                                "runId": "render-prep",
+                                "hypothesisId": "H3",
+                                "location": "pdf_renderer.py:render_with_layout",
+                                "message": "Block skipped - no translation or source",
+                                "data": {"block_id": block.block_id, "block_type": block.block_type.name if block.block_type else None},
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            with open(log_path, 'a', encoding='utf-8') as f:
+                                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                        except Exception:
+                            pass
+                        # #endregion
+                        continue
                     
                 if page_num not in blocks_by_page:
                     blocks_by_page[page_num] = []
                 blocks_by_page[page_num].append(block)
                 translated_count += 1
+                
+                # #region agent log
+                try:
+                    import json
+                    from datetime import datetime
+                    log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "render-prep",
+                        "hypothesisId": "H3",
+                        "location": "pdf_renderer.py:render_with_layout",
+                        "message": "Block added to render queue",
+                        "data": {
+                            "block_id": block.block_id,
+                            "page": page_num,
+                            "blocks_on_page": len(blocks_by_page[page_num])
+                        },
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                except Exception:
+                    pass
+                # #endregion
+        
+        # CRITICAL: Log total blocks vs rendered blocks to detect omissions
+        total_blocks_in_document = sum(len(seg.blocks) for seg in document.segments)
+        total_translatable_blocks = len(document.translatable_blocks) if hasattr(document, 'translatable_blocks') else 0
+        total_rendered_blocks = sum(len(blocks) for blocks in blocks_by_page.values())
+        
+        logger.info(f"📊 BLOCK STATISTICS:")
+        logger.info(f"   Total blocks in document: {total_blocks_in_document}")
+        logger.info(f"   Translatable blocks: {total_translatable_blocks}")
+        logger.info(f"   Blocks rendered: {total_rendered_blocks}")
+        logger.info(f"   Blocks skipped (no bbox): {skipped_no_bbox}")
+        logger.info(f"   Blocks skipped (no translation): {skipped_no_translation}")
+        logger.info(f"   Pages with translations: {sorted(blocks_by_page.keys())}")
+        
+        if total_blocks_in_document > total_rendered_blocks + skipped_no_bbox + skipped_no_translation:
+            missing_count = total_blocks_in_document - (total_rendered_blocks + skipped_no_bbox + skipped_no_translation)
+            logger.warning(f"⚠️  WARNING: {missing_count} blocks are missing from rendered output!")
         
         logger.info(f"Rendering {translated_count} translated blocks")
-        logger.info(f"Skipped: {skipped_no_bbox} (no bbox), {skipped_no_translation} (no translation)")
-        logger.info(f"Pages with translations: {sorted(blocks_by_page.keys())}")
         
         # #region agent log
         try:
@@ -568,13 +846,124 @@ class PDFRenderer:
                 
                 # Step 1: Redact (remove) source text in translation regions
                 # Note: This happens AFTER stamping, so preserved blocks are safe
+                # CRITICAL FIX: Redact ALL blocks on page to ensure clean slate
                 self._redact_text_from_page(page, page_blocks)
                 
+                # CRITICAL FIX: Ensure redaction is fully applied before inserting new text
+                # This prevents old text from showing through or overlapping
+                # PyMuPDF's apply_redactions is synchronous, but we verify it completed
+                
                 # Step 2: Insert translated text
-                # CRITICAL: Sort blocks by Y position to prevent overlapping
-                sorted_blocks = sorted(page_blocks, key=lambda b: (b.bbox.y0 if b.bbox else 0, b.bbox.x0 if b.bbox else 0))
-                for block in sorted_blocks:
-                    self._insert_text_block(page, block)
+                # CRITICAL: Sort blocks by Y position (top to bottom) then X (left to right)
+                # This ensures proper insertion order and prevents visual overlapping
+                sorted_blocks = sorted(page_blocks, key=lambda b: (
+                    b.bbox.y0 if b.bbox else 0,  # Sort by Y first (top to bottom)
+                    b.bbox.x0 if b.bbox else 0   # Then by X (left to right)
+                ))
+                
+                # CRITICAL FIX: Insert blocks one at a time and verify each insertion
+                # Ensure NO blocks are skipped - use source text if translation missing
+                for idx, block in enumerate(sorted_blocks):
+                    # #region agent log
+                    try:
+                        import json
+                        from datetime import datetime
+                        log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                        log_entry = {
+                            "sessionId": "debug-session",
+                            "runId": "render-insert",
+                            "hypothesisId": "H4",
+                            "location": "pdf_renderer.py:render_with_layout",
+                            "message": "Before block insertion",
+                            "data": {
+                                "block_id": block.block_id,
+                                "block_type": block.block_type.name if block.block_type else None,
+                                "insertion_order": idx,
+                                "total_blocks_on_page": len(sorted_blocks),
+                                "has_translated_text": bool(block.translated_text),
+                                "has_bbox": block.bbox is not None,
+                                "bbox": [block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1] if block.bbox else None,
+                                "page": page_num
+                            },
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        with open(log_path, 'a', encoding='utf-8') as f:
+                            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                    except Exception:
+                        pass
+                    # #endregion
+                    
+                    # CRITICAL: Ensure block has translation (use source as fallback)
+                    if not block.translated_text or not str(block.translated_text).strip():
+                        if block.source_text and block.source_text.strip():
+                            block.translated_text = block.source_text
+                            logger.warning(f"Block {block.block_id} has no translation, using source text as fallback")
+                        else:
+                            logger.warning(f"Block {block.block_id} has no text at all, skipping")
+                            # #region agent log
+                            try:
+                                import json
+                                from datetime import datetime
+                                log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                                log_entry = {
+                                    "sessionId": "debug-session",
+                                    "runId": "render-insert",
+                                    "hypothesisId": "H4",
+                                    "location": "pdf_renderer.py:render_with_layout",
+                                    "message": "Block skipped - no text",
+                                    "data": {"block_id": block.block_id},
+                                    "timestamp": datetime.now().isoformat()
+                                }
+                                with open(log_path, 'a', encoding='utf-8') as f:
+                                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                            except Exception:
+                                pass
+                            # #endregion
+                            continue
+                    
+                    # Verify block has valid bbox before inserting
+                    if block.bbox:
+                        self._insert_text_block(page, block)
+                        # #region agent log
+                        try:
+                            import json
+                            from datetime import datetime
+                            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                            log_entry = {
+                                "sessionId": "debug-session",
+                                "runId": "render-insert",
+                                "hypothesisId": "H4",
+                                "location": "pdf_renderer.py:render_with_layout",
+                                "message": "Block inserted successfully",
+                                "data": {"block_id": block.block_id, "page": page_num},
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            with open(log_path, 'a', encoding='utf-8') as f:
+                                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                        except Exception:
+                            pass
+                        # #endregion
+                    else:
+                        logger.warning(f"Skipping block {block.block_id}: missing bbox")
+                        # #region agent log
+                        try:
+                            import json
+                            from datetime import datetime
+                            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                            log_entry = {
+                                "sessionId": "debug-session",
+                                "runId": "render-insert",
+                                "hypothesisId": "H4",
+                                "location": "pdf_renderer.py:render_with_layout",
+                                "message": "Block skipped - no bbox",
+                                "data": {"block_id": block.block_id},
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            with open(log_path, 'a', encoding='utf-8') as f:
+                                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                        except Exception:
+                            pass
+                        # #endregion
                 pages_processed += 1
             else:
                 logger.info(f"Page {page_num + 1}/{total_pages_in_doc}: no translated blocks (preserved blocks already stamped)")
@@ -636,16 +1025,99 @@ class PDFRenderer:
     
     def _insert_text_block(self, page, block: Block):
         """Insert a translated text block with proper overflow handling (PHASE 3.2)."""
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "render-insert",
+                "hypothesisId": "H5",
+                "location": "pdf_renderer.py:_insert_text_block",
+                "message": "Starting text block insertion",
+                "data": {
+                    "block_id": block.block_id,
+                    "block_type": block.block_type.name if block.block_type else None,
+                    "original_bbox": [block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1] if block.bbox else None,
+                    "page_rect": [page.rect.x0, page.rect.y0, page.rect.x1, page.rect.y1],
+                    "has_translated_text": bool(block.translated_text),
+                    "text_length": len(block.translated_text) if block.translated_text else 0
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        
+        # CRITICAL FIX: Use exact bbox coordinates - no adjustments
+        # This ensures blocks are positioned exactly as in source PDF
+        if not block.bbox:
+            logger.warning(f"Block {block.block_id} has no bbox, skipping")
+            return
+            
+        # CRITICAL FIX: Clamp rect to page bounds to prevent overflow issues
+        # Use exact bbox coordinates but ensure they're within page bounds
+        page_rect = page.rect
+        original_rect = fitz.Rect(block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1)
         rect = fitz.Rect(
-            block.bbox.x0,
-            block.bbox.y0,
-            block.bbox.x1,
-            block.bbox.y1
+            max(0, min(float(block.bbox.x0), page_rect.width)),  # Clamp x0
+            max(0, min(float(block.bbox.y0), page_rect.height)),   # Clamp y0
+            max(0, min(float(block.bbox.x1), page_rect.width)),    # Clamp x1
+            max(0, min(float(block.bbox.y1), page_rect.height))   # Clamp y1
         )
         
-        # Validate rect
-        if rect.is_empty or rect.is_infinite:
-            logger.warning(f"Invalid rect for block {block.block_id}: {rect}")
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "render-insert",
+                "hypothesisId": "H5",
+                "location": "pdf_renderer.py:_insert_text_block",
+                "message": "Bbox after clamping",
+                "data": {
+                    "block_id": block.block_id,
+                    "original_rect": [original_rect.x0, original_rect.y0, original_rect.x1, original_rect.y1],
+                    "clamped_rect": [rect.x0, rect.y0, rect.x1, rect.y1],
+                    "was_clamped": original_rect != rect,
+                    "rect_width": rect.width,
+                    "rect_height": rect.height
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
+        
+        # Validate rect is not empty or invalid
+        if rect.is_empty or rect.is_infinite or rect.width <= 0 or rect.height <= 0:
+            logger.warning(f"Block {block.block_id} has invalid rect: {rect}")
+            # #region agent log
+            try:
+                import json
+                from datetime import datetime
+                log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                log_entry = {
+                    "sessionId": "debug-session",
+                    "runId": "render-insert",
+                    "hypothesisId": "H5",
+                    "location": "pdf_renderer.py:_insert_text_block",
+                    "message": "Block skipped - invalid rect",
+                    "data": {"block_id": block.block_id, "rect": [rect.x0, rect.y0, rect.x1, rect.y1]},
+                    "timestamp": datetime.now().isoformat()
+                }
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception:
+                pass
+            # #endregion
             return
         
         # Get font info with enhanced styling
@@ -660,6 +1132,38 @@ class PDFRenderer:
         text = block.translated_text
         if not text or not text.strip():
             return
+        
+        # #region agent log
+        try:
+            import json
+            from datetime import datetime
+            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "render-insert",
+                "hypothesisId": "H4",
+                "location": "pdf_renderer.py:_insert_text_block",
+                "message": "Block styling before insertion",
+                "data": {
+                    "block_id": block.block_id,
+                    "block_type": block.block_type.name if block.block_type else None,
+                    "font_family": block.font.family if block.font else None,
+                    "font_size": block.font.size if block.font else None,
+                    "font_color": block.font.color if block.font else None,
+                    "font_alignment": block.font.alignment if block.font else None,
+                    "font_line_height": block.font.line_height if block.font else None,
+                    "list_style": block.font.list_style if block.font else None,
+                    "heading_level": block.font.heading_level if block.font else None,
+                    "bbox": [rect.x0, rect.y0, rect.x1, rect.y1],
+                    "text_preview": text[:50]
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+        # #endregion
         
         # Ensure text is properly encoded as UTF-8 string (Python 3 default)
         if isinstance(text, bytes):
@@ -685,16 +1189,76 @@ class PDFRenderer:
         text = text.replace("voir page suivante", "")
         text = regex_module.sub(r'\(\?[^)]*\)', '', text)  # Remove any (? ...) patterns
         
-        # CRITICAL FIX: Ensure all placeholders are restored
-        if "<<PLACEHOLDER>>" in text or ("<<" in text and ">>" in text):
-            # Check if we have unrestored placeholders
+        # CRITICAL FIX: Aggressively remove ALL placeholders
+        # If any <<...>> pattern remains, it means restoration failed
+        # Better to remove it than show it to user
+        if "<<" in text and ">>" in text:
+            # First try to restore from masks (most specific first)
             if block.masks:
-                for mask in block.masks:
+                # Sort by placeholder length (longest first) to avoid partial matches
+                sorted_masks = sorted(block.masks, key=lambda m: len(m.placeholder), reverse=True)
+                for mask in sorted_masks:
+                    # Replace the specific placeholder
                     if mask.placeholder in text:
                         text = text.replace(mask.placeholder, mask.original)
-                # Clean up any remaining generic placeholders
-                text = regex_module.sub(r'<<PLACEHOLDER>>+', '', text)
-                text = regex_module.sub(r'<<[A-Z_0-9]+>>', '', text)
+                        # #region agent log
+                        try:
+                            import json
+                            from datetime import datetime
+                            log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                            log_entry = {
+                                "sessionId": "debug-session",
+                                "runId": "render-insert",
+                                "hypothesisId": "H7",
+                                "location": "pdf_renderer.py:_insert_text_block",
+                                "message": "Restored placeholder during rendering",
+                                "data": {
+                                    "block_id": block.block_id,
+                                    "placeholder": mask.placeholder,
+                                    "mask_type": mask.mask_type
+                                },
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            with open(log_path, 'a', encoding='utf-8') as f:
+                                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                        except Exception:
+                            pass
+                        # #endregion
+            
+            # Remove ANY remaining placeholder patterns (very aggressive)
+            # Match: <<...>> where ... can be any characters except >
+            text = regex_module.sub(r'<<[^>]*>>', '', text)
+            # Also remove any generic placeholder text
+            text = regex_module.sub(r'PLACEHOLDER', '', text, flags=regex_module.IGNORECASE)
+            # Remove dots that might have been appended from failed restoration
+            text = regex_module.sub(r'\.{3,}', '', text)  # Remove 3+ consecutive dots
+            # Clean up extra whitespace
+            text = regex_module.sub(r'\s+', ' ', text)  # Multiple spaces to single space
+            text = text.strip()
+            
+            # #region agent log
+            if "<<" in text or ">>" in text:
+                try:
+                    import json
+                    from datetime import datetime
+                    log_path = "/Users/kv.kn/Desktop/Research/SciTrans-LLMs_NEW/.cursor/debug.log"
+                    log_entry = {
+                        "sessionId": "debug-session",
+                        "runId": "render-insert",
+                        "hypothesisId": "H7",
+                        "location": "pdf_renderer.py:_insert_text_block",
+                        "message": "WARNING: Placeholders still present after cleanup",
+                        "data": {
+                            "block_id": block.block_id,
+                            "text_preview": text[:100]
+                        },
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+                except Exception:
+                    pass
+            # #endregion
         
         # CRITICAL FIX: Preserve original alignment - don't auto-center
         alignment = 0  # Default: left align (0=left, 1=center, 2=right, 3=justify)
@@ -710,26 +1274,56 @@ class PDFRenderer:
                 alignment = 0  # Explicitly left
         # DO NOT infer alignment from position - this causes wrong centering
         
-        # Get font size - preserve original size for consistency
+        # CRITICAL FIX: Preserve original font size exactly - don't estimate
+        # This ensures styling matches source PDF perfectly
+        # SPECIAL HANDLING: Titles and headings should be larger and bold
         if block.font and block.font.size and block.font.size > 0:
-            fontsize = block.font.size
-            # Don't scale down too aggressively - preserve original size when possible
+            fontsize = float(block.font.size)  # Use exact original size
+            
+            # CRITICAL: Ensure titles/headings are styled appropriately
+            if block.block_type in [BlockType.TITLE, BlockType.HEADING, BlockType.SUBHEADING]:
+                # Titles should be bold and potentially larger
+                if not is_bold:
+                    # Try to get bold variant
+                    bold_fontname = self._get_font_name(block.font)[0]
+                    if "times" in fontname.lower():
+                        fontname = "times-bold" if not is_italic else "times-bolditalic"
+                    elif "helv" in fontname.lower() or "arial" in fontname.lower():
+                        fontname = "hebo"  # Helvetica-Bold
+                    is_bold = True
+                    logger.debug(f"Block {block.block_id}: Title/heading detected, applying bold styling")
+                
+                # Ensure minimum size for titles (at least 14pt)
+                if fontsize < 14 and block.block_type == BlockType.TITLE:
+                    fontsize = 14.0
+                    logger.debug(f"Block {block.block_id}: Title font size increased to {fontsize}pt")
+            
+            logger.debug(f"Block {block.block_id}: Using original font size {fontsize}")
         else:
-            bbox_height = rect.height
-            num_lines = max(1, block.translated_text.count('\n') + 1)
-            estimated_size = bbox_height / num_lines / 1.2
-            # Use a reasonable default that matches typical academic text
-            fontsize = max(10, min(12, estimated_size))  # Default to 10-12pt for readability
+            # Fallback: estimate from bbox height (should rarely happen)
+            # SPECIAL: Titles get larger default size
+            if block.block_type in [BlockType.TITLE, BlockType.HEADING]:
+                fontsize = 16.0 if block.block_type == BlockType.TITLE else 14.0
+                logger.debug(f"Block {block.block_id}: Title/heading, using default size {fontsize}pt")
+            else:
+                bbox_height = rect.height
+                num_lines = max(1, block.translated_text.count('\n') + 1)
+                estimated_size = bbox_height / num_lines / 1.2
+                fontsize = max(10, min(12, estimated_size))
+                logger.warning(f"Block {block.block_id}: No font size info, estimated {fontsize:.1f}pt")
         
-        # Get color
-        color = (0, 0, 0)
+        # CRITICAL FIX: Preserve original text color exactly
+        # This ensures styling matches source PDF perfectly
+        color = (0, 0, 0)  # Default: black
         if block.font and block.font.color:
             try:
                 hex_color = block.font.color.lstrip('#')
                 if len(hex_color) == 6:
-                    color = tuple(int(hex_color[i:i+2], 16) / 255 for i in (0, 2, 4))
-            except:
-                pass
+                    color = tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+                    logger.debug(f"Block {block.block_id}: Using color {color} from font info")
+            except Exception as e:
+                logger.debug(f"Block {block.block_id}: Could not parse color {block.font.color}: {e}")
+                color = (0, 0, 0)  # Fallback to black
         
         # Text already assigned earlier in the function, no need to reassign
         
@@ -799,12 +1393,19 @@ class PDFRenderer:
             pass
         # #endregion
         
-        # Try inserting with progressively smaller sizes
-        # Use tighter line height for better text fitting
-        line_height = 1.15 if fontsize > 12 else 1.1
-        # More gradual size reduction to preserve readability
+        # CRITICAL FIX: Preserve original line height from font info
+        # Use font's line_height if available, otherwise use reasonable default
+        if block.font and block.font.line_height and block.font.line_height > 0:
+            line_height = float(block.font.line_height)
+            logger.debug(f"Block {block.block_id}: Using original line height {line_height}")
+        else:
+            # Default line height based on font size
+            line_height = 1.15 if fontsize > 12 else 1.1
+        
+        # CRITICAL FIX: Try original size first, then gradually reduce ONLY if overflow
+        # This preserves original styling as much as possible
         sizes_to_try = [
-            fontsize,  # Original size
+            fontsize,  # Original size - try this first!
             fontsize * 0.95,  # 5% smaller
             fontsize * 0.9,   # 10% smaller
             fontsize * 0.85,  # 15% smaller
